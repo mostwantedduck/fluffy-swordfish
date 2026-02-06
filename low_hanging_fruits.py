@@ -31,7 +31,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     """Main Burp Suite extension class."""
     
     EXTENSION_NAME = "LowHangingFruits"
-    VERSION = "1.0.0"
+    VERSION = "1.0.1"
     
     # Media types to skip
     MEDIA_TYPES = [
@@ -185,9 +185,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     def _load_settings(self):
         """Load extension settings from Burp."""
         # Default settings
+        # merge_duplicates options: "match_only", "match_and_url", "none"
         self._settings = {
             "only_in_scope": False,
-            "skip_media": True
+            "skip_media": True,
+            "merge_duplicates": "match_only"
         }
         
         try:
@@ -375,6 +377,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._skip_media_checkbox.setSelected(self._settings.get("skip_media", True))
         self._skip_media_checkbox.addActionListener(SettingsChangeListener(self))
         general_panel.add(self._skip_media_checkbox)
+        
+        # Merge duplicates setting
+        merge_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        merge_panel.add(JLabel("Merge Duplicates:"))
+        merge_options = ["By Match Only", "By Match + URL", "No Merging (Show All)"]
+        self._merge_combo = JComboBox(merge_options)
+        current_merge = self._settings.get("merge_duplicates", "match_only")
+        if current_merge == "match_only":
+            self._merge_combo.setSelectedIndex(0)
+        elif current_merge == "match_and_url":
+            self._merge_combo.setSelectedIndex(1)
+        else:
+            self._merge_combo.setSelectedIndex(2)
+        self._merge_combo.addActionListener(MergeDuplicatesListener(self))
+        merge_panel.add(self._merge_combo)
+        general_panel.add(merge_panel)
         
         panel.add(general_panel)
         panel.add(Box.createVerticalStrut(10))
@@ -607,10 +625,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     def _add_result(self, category, match, url, messageInfo):
         """Add a result to the table."""
         with self._lock:
-            # Check for duplicates
-            for result in self._results:
-                if result['category'] == category and result['match'] == match:
-                    return
+            # Check for duplicates based on merge setting
+            merge_mode = self._settings.get("merge_duplicates", "match_only")
+            
+            if merge_mode != "none":
+                for result in self._results:
+                    if result['category'].lower() == category.lower() and result['match'] == match:
+                        if merge_mode == "match_only":
+                            # Duplicate by match only - skip
+                            return
+                        elif merge_mode == "match_and_url" and result['url'] == url:
+                            # Duplicate by match and URL - skip
+                            return
             
             result = {
                 'category': category.capitalize(),
@@ -901,6 +927,22 @@ class SettingsChangeListener(ActionListener):
         self._extender._settings["only_in_scope"] = self._extender._scope_checkbox.isSelected()
         self._extender._settings["skip_media"] = self._extender._skip_media_checkbox.isSelected()
         self._extender._save_settings()
+
+
+class MergeDuplicatesListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        selected_index = self._extender._merge_combo.getSelectedIndex()
+        if selected_index == 0:
+            self._extender._settings["merge_duplicates"] = "match_only"
+        elif selected_index == 1:
+            self._extender._settings["merge_duplicates"] = "match_and_url"
+        else:
+            self._extender._settings["merge_duplicates"] = "none"
+        self._extender._save_settings()
+        print("[+] Merge duplicates mode: {}".format(self._extender._settings["merge_duplicates"]))
 
 
 class PatternCategoryListener(ActionListener):
