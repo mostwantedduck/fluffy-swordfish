@@ -12,14 +12,16 @@ from javax.swing import (
     JPanel, JTable, JScrollPane, JSplitPane, JLabel, JComboBox, JCheckBox,
     JButton, JTextField, JTextArea, JTabbedPane, JFileChooser, JOptionPane,
     SwingConstants, BorderFactory, BoxLayout, Box, ListSelectionModel,
-    JPopupMenu, JMenuItem
+    JPopupMenu, JMenuItem, DefaultCellEditor
 )
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from javax.swing.event import ListSelectionListener
 from javax.swing.filechooser import FileNameExtensionFilter
-from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, Font
+from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, Font, Desktop, Toolkit
 from java.awt.event import ActionListener, MouseAdapter
+from java.awt.datatransfer import StringSelection
 from java.io import File
+from java.net import URI
 from java.lang import Runnable
 import re
 import json
@@ -82,9 +84,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._current_request = None
         self._current_response = None
         
+        # Initialize exclusions (false positives)
+        self._exclusions = {'matches': [], 'urls': []}
+        
         # Load patterns and settings
         self._load_patterns()
         self._load_settings()
+        self._load_exclusions()
         
         # Build UI
         self._build_ui()
@@ -229,6 +235,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         except Exception as e:
             print("[-] Error saving settings: {}".format(str(e)))
     
+    def _load_exclusions(self):
+        """Load false positive exclusions from Burp settings."""
+        try:
+            exclusions_json = self._callbacks.loadExtensionSetting("exclusions")
+            if exclusions_json:
+                self._exclusions = json.loads(exclusions_json)
+                print("[+] Loaded {} match exclusions, {} URL exclusions".format(
+                    len(self._exclusions.get('matches', [])),
+                    len(self._exclusions.get('urls', []))
+                ))
+        except Exception as e:
+            print("[-] Error loading exclusions: {}".format(str(e)))
+    
+    def _save_exclusions(self):
+        """Save false positive exclusions to Burp settings."""
+        try:
+            self._callbacks.saveExtensionSetting("exclusions", json.dumps(self._exclusions))
+            print("[+] Exclusions saved")
+        except Exception as e:
+            print("[-] Error saving exclusions: {}".format(str(e)))
+    
     def _save_custom_patterns(self):
         """Save custom patterns to Burp settings."""
         try:
@@ -353,8 +380,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._results_table.getColumnModel().getColumn(2).setPreferredWidth(380)
         self._results_table.getColumnModel().getColumn(3).setPreferredWidth(270)
         
-        # Color-code severity column
+        # Color-code severity column with editable dropdown
         self._results_table.getColumnModel().getColumn(1).setCellRenderer(SeverityCellRenderer())
+        severity_combo = JComboBox(["High", "Medium", "Low", "Info"])
+        self._results_table.getColumnModel().getColumn(1).setCellEditor(DefaultCellEditor(severity_combo))
         
         # Set row height
         self._results_table.setRowHeight(25)
@@ -501,10 +530,49 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         noise_panel.add(noise_buttons, BorderLayout.SOUTH)
         
         panel.add(noise_panel)
+        panel.add(Box.createVerticalStrut(10))
         
-        # Load initial pattern/noise values
+        # Exclusions (False Positives) section
+        excl_panel = JPanel()
+        excl_panel.setLayout(BoxLayout(excl_panel, BoxLayout.Y_AXIS))
+        excl_panel.setBorder(BorderFactory.createTitledBorder("Exclusions (False Positives)"))
+        excl_panel.setAlignmentX(0.0)
+        
+        # Excluded matches
+        excl_matches_label = JPanel(FlowLayout(FlowLayout.LEFT))
+        excl_matches_label.add(JLabel("Excluded Matches (one per line):"))
+        excl_panel.add(excl_matches_label)
+        
+        self._excl_matches_text = JTextArea(4, 50)
+        self._excl_matches_text.setFont(Font("Monospaced", Font.PLAIN, 12))
+        excl_panel.add(JScrollPane(self._excl_matches_text))
+        
+        # Excluded URLs
+        excl_urls_label = JPanel(FlowLayout(FlowLayout.LEFT))
+        excl_urls_label.add(JLabel("Excluded URLs (one per line):"))
+        excl_panel.add(excl_urls_label)
+        
+        self._excl_urls_text = JTextArea(4, 50)
+        self._excl_urls_text.setFont(Font("Monospaced", Font.PLAIN, 12))
+        excl_panel.add(JScrollPane(self._excl_urls_text))
+        
+        excl_buttons = JPanel(FlowLayout(FlowLayout.LEFT))
+        save_excl_btn = JButton("Save Exclusions")
+        save_excl_btn.addActionListener(SaveExclusionsListener(self))
+        excl_buttons.add(save_excl_btn)
+        
+        clear_excl_btn = JButton("Clear All Exclusions")
+        clear_excl_btn.addActionListener(ClearExclusionsListener(self))
+        excl_buttons.add(clear_excl_btn)
+        
+        excl_panel.add(excl_buttons)
+        
+        panel.add(excl_panel)
+        
+        # Load initial pattern/noise/exclusion values
         self._update_patterns_display()
         self._update_noise_display()
+        self._update_exclusions_display()
         
         return panel
     
@@ -747,9 +815,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             self._results_count_label.setText("Results: {} / {} (filtered)".format(len(filtered), total))
     
     def _get_filtered_results(self):
-        """Get results filtered by category and search text."""
+        """Get results filtered by category, search text, and exclusions."""
         filter_category = str(self._category_filter.getSelectedItem())
         search_text = str(self._search_field.getText()).strip().lower()
+        excluded_matches = set(self._exclusions.get('matches', []))
+        excluded_urls = set(self._exclusions.get('urls', []))
         
         results = self._results
         
@@ -759,7 +829,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         if search_text:
             results = [r for r in results if search_text in r['match'].lower() or search_text in r['url'].lower()]
         
+        if excluded_matches or excluded_urls:
+            results = [r for r in results if r['match'] not in excluded_matches and r['url'] not in excluded_urls]
+        
         return results
+    
+    def _update_exclusions_display(self):
+        """Update the exclusions text areas in settings."""
+        try:
+            self._excl_matches_text.setText("\n".join(self._exclusions.get('matches', [])))
+            self._excl_urls_text.setText("\n".join(self._exclusions.get('urls', [])))
+        except Exception:
+            pass
     
     # ==================== IContextMenuFactory Implementation ====================
     
@@ -972,6 +1053,16 @@ class ResultsTableModel(AbstractTableModel):
     def getColumnName(self, column):
         return self.COLUMNS[column]
     
+    def isCellEditable(self, row, column):
+        return column == 1
+    
+    def setValueAt(self, value, row, column):
+        if column == 1:
+            filtered = self._extender._get_filtered_results()
+            if row < len(filtered):
+                filtered[row]['severity'] = str(value)
+                self.fireTableCellUpdated(row, column)
+    
     def getValueAt(self, row, column):
         filtered = self._extender._get_filtered_results()
         if row < len(filtered):
@@ -1119,6 +1210,26 @@ class ResultsTableMouseListener(MouseAdapter):
                 comparer_req_item.addActionListener(SendToComparerListener(self._extender, True))
                 popup.add(comparer_req_item)
                 
+                popup.addSeparator()
+                
+                copy_match_item = JMenuItem("Copy Match Value")
+                copy_match_item.addActionListener(CopyValueListener(self._extender, 'match'))
+                popup.add(copy_match_item)
+                
+                copy_url_item = JMenuItem("Copy URL")
+                copy_url_item.addActionListener(CopyValueListener(self._extender, 'url'))
+                popup.add(copy_url_item)
+                
+                open_url_item = JMenuItem("Open URL in Browser")
+                open_url_item.addActionListener(OpenUrlListener(self._extender))
+                popup.add(open_url_item)
+                
+                popup.addSeparator()
+                
+                fp_item = JMenuItem("Mark as False Positive...")
+                fp_item.addActionListener(MarkFalsePositiveListener(self._extender))
+                popup.add(fp_item)
+                
                 popup.show(event.getComponent(), event.getX(), event.getY())
 
 
@@ -1145,6 +1256,84 @@ class SendToComparerListener(ActionListener):
     
     def actionPerformed(self, event):
         self._extender._send_to_comparer(self._is_request)
+
+
+class CopyValueListener(ActionListener):
+    def __init__(self, extender, field):
+        self._extender = extender
+        self._field = field
+    
+    def actionPerformed(self, event):
+        row = self._extender._results_table.getSelectedRow()
+        if row < 0:
+            return
+        filtered = self._extender._get_filtered_results()
+        if row < len(filtered):
+            value = filtered[row].get(self._field, '')
+            clipboard = Toolkit.getDefaultToolkit().getSystemClipboard()
+            clipboard.setContents(StringSelection(value), None)
+            print("[+] Copied to clipboard: {}".format(value[:50]))
+
+
+class OpenUrlListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        row = self._extender._results_table.getSelectedRow()
+        if row < 0:
+            return
+        filtered = self._extender._get_filtered_results()
+        if row < len(filtered):
+            url = filtered[row].get('url', '')
+            if url:
+                try:
+                    Desktop.getDesktop().browse(URI(url))
+                    print("[+] Opened URL in browser: {}".format(url))
+                except Exception as e:
+                    print("[-] Error opening URL: {}".format(str(e)))
+
+
+class MarkFalsePositiveListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        row = self._extender._results_table.getSelectedRow()
+        if row < 0:
+            return
+        filtered = self._extender._get_filtered_results()
+        if row >= len(filtered):
+            return
+        result = filtered[row]
+        
+        options = ["Exclude by Match", "Exclude by URL", "Cancel"]
+        choice = JOptionPane.showOptionDialog(
+            self._extender._main_panel,
+            "Exclude future results matching:\n\nMatch: {}\nURL: {}".format(
+                result['match'][:80], result['url'][:80]),
+            "Mark as False Positive",
+            JOptionPane.DEFAULT_OPTION,
+            JOptionPane.QUESTION_MESSAGE,
+            None,
+            options,
+            options[0]
+        )
+        
+        if choice == 0:
+            self._extender._exclusions['matches'].append(result['match'])
+            self._extender._save_exclusions()
+            self._extender._table_model.fireTableDataChanged()
+            self._extender._update_results_count()
+            self._extender._update_exclusions_display()
+            print("[+] Excluded match: {}".format(result['match'][:50]))
+        elif choice == 1:
+            self._extender._exclusions['urls'].append(result['url'])
+            self._extender._save_exclusions()
+            self._extender._table_model.fireTableDataChanged()
+            self._extender._update_results_count()
+            self._extender._update_exclusions_display()
+            print("[+] Excluded URL: {}".format(result['url'][:50]))
 
 
 class SettingsChangeListener(ActionListener):
@@ -1360,6 +1549,49 @@ class SaveNoiseListener(ActionListener):
             "Save Complete",
             JOptionPane.INFORMATION_MESSAGE
         )
+
+
+class SaveExclusionsListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        matches_text = self._extender._excl_matches_text.getText()
+        urls_text = self._extender._excl_urls_text.getText()
+        self._extender._exclusions['matches'] = [m.strip() for m in matches_text.split('\n') if m.strip()]
+        self._extender._exclusions['urls'] = [u.strip() for u in urls_text.split('\n') if u.strip()]
+        self._extender._save_exclusions()
+        self._extender._table_model.fireTableDataChanged()
+        self._extender._update_results_count()
+        
+        JOptionPane.showMessageDialog(
+            self._extender._main_panel,
+            "Exclusions saved ({} matches, {} URLs)".format(
+                len(self._extender._exclusions['matches']),
+                len(self._extender._exclusions['urls'])),
+            "Save Complete",
+            JOptionPane.INFORMATION_MESSAGE
+        )
+
+
+class ClearExclusionsListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        confirm = JOptionPane.showConfirmDialog(
+            self._extender._main_panel,
+            "Clear all exclusions? This will show previously excluded results.",
+            "Clear Exclusions",
+            JOptionPane.YES_NO_OPTION
+        )
+        if confirm == JOptionPane.YES_OPTION:
+            self._extender._exclusions = {'matches': [], 'urls': []}
+            self._extender._save_exclusions()
+            self._extender._update_exclusions_display()
+            self._extender._table_model.fireTableDataChanged()
+            self._extender._update_results_count()
+            print("[+] All exclusions cleared")
 
 
 class UpdateTableRunnable(Runnable):
