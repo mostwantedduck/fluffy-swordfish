@@ -12,8 +12,9 @@ from javax.swing import (
     JPanel, JTable, JScrollPane, JSplitPane, JLabel, JComboBox, JCheckBox,
     JButton, JTextField, JTextArea, JTabbedPane, JFileChooser, JOptionPane,
     SwingConstants, BorderFactory, BoxLayout, Box, ListSelectionModel,
-    JPopupMenu, JMenuItem, DefaultCellEditor
+    JPopupMenu, JMenuItem, DefaultCellEditor, SwingUtilities
 )
+from javax.swing.text import DefaultHighlighter, JTextComponent
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from javax.swing.event import ListSelectionListener
 from javax.swing.filechooser import FileNameExtensionFilter
@@ -1173,21 +1174,11 @@ class ResultSelectionListener(ListSelectionListener):
             self._extender._request_viewer.setMessage(messageInfo.getRequest(), True)
             self._extender._response_viewer.setMessage(messageInfo.getResponse(), False)
             
-            # Try to highlight the match in response
-            try:
-                match_str = result.get('match', '')
-                response = messageInfo.getResponse()
-                if response and match_str:
-                    response_str = self._extender._helpers.bytesToString(response)
-                    resp_info = self._extender._helpers.analyzeResponse(response)
-                    body_offset = resp_info.getBodyOffset()
-                    match_start = response_str.find(match_str, body_offset)
-                    if match_start >= 0:
-                        markers = [[match_start, match_start + len(match_str)]]
-                        marked = self._extender._callbacks.applyMarkers(messageInfo, None, markers)
-                        self._extender._response_viewer.setMessage(marked.getResponse(), False)
-            except Exception:
-                pass
+            # Highlight all occurrences of the match in the response viewer
+            match_str = result.get('match', '')
+            if match_str:
+                viewer_component = self._extender._response_viewer.getComponent()
+                SwingUtilities.invokeLater(HighlightMatchRunnable(viewer_component, match_str))
 
 
 class ResultsTableMouseListener(MouseAdapter):
@@ -1608,6 +1599,65 @@ class ClearExclusionsListener(ActionListener):
             self._extender._table_model.fireTableDataChanged()
             self._extender._update_results_count()
             print("[+] All exclusions cleared")
+
+
+class HighlightMatchRunnable(Runnable):
+    """Highlights all occurrences of a match string in a Swing component tree and scrolls to the first."""
+    
+    HIGHLIGHT_COLOR = Color(255, 165, 0, 120)
+    
+    def __init__(self, component, match_str):
+        self._component = component
+        self._match_str = match_str
+    
+    def run(self):
+        try:
+            text_components = self._find_text_components(self._component)
+            painter = DefaultHighlighter.DefaultHighlightPainter(self.HIGHLIGHT_COLOR)
+            
+            for tc in text_components:
+                text = tc.getText()
+                if not text or self._match_str not in text:
+                    continue
+                
+                highlighter = tc.getHighlighter()
+                highlighter.removeAllHighlights()
+                
+                match_len = len(self._match_str)
+                first_pos = -1
+                start = 0
+                while True:
+                    idx = text.find(self._match_str, start)
+                    if idx < 0:
+                        break
+                    highlighter.addHighlight(idx, idx + match_len, painter)
+                    if first_pos < 0:
+                        first_pos = idx
+                    start = idx + match_len
+                
+                # Scroll to first occurrence
+                if first_pos >= 0:
+                    tc.setCaretPosition(first_pos)
+                    try:
+                        rect = tc.modelToView(first_pos)
+                        if rect:
+                            tc.scrollRectToVisible(rect)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    
+    def _find_text_components(self, component):
+        """Recursively find all JTextComponent instances."""
+        results = []
+        if isinstance(component, JTextComponent):
+            results.append(component)
+        try:
+            for i in range(component.getComponentCount()):
+                results.extend(self._find_text_components(component.getComponent(i)))
+        except Exception:
+            pass
+        return results
 
 
 class UpdateTableRunnable(Runnable):
