@@ -57,6 +57,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         # Initialize data structures
         self._results = []
+        self._seen_match_only = set()
+        self._seen_match_and_url = set()
         self._lock = threading.Lock()
         self._current_request = None
         self._current_response = None
@@ -143,8 +145,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         # Load custom patterns from Burp settings
         self._load_custom_patterns()
         
-        # Compile patterns
+        # Compile patterns and noise filters
         self._compile_patterns()
+        self._compile_noise_filters()
     
     def _load_custom_patterns(self):
         """Load custom patterns from Burp's extension settings."""
@@ -601,23 +604,29 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                 except Exception as e:
                     print("[-] Error matching pattern: {}".format(str(e)))
     
+    def _compile_noise_filters(self):
+        """Pre-compute lowercased noise filter lists for fast matching."""
+        self._noise_domains_lower = [d.lower() for d in self._noise_filters.get("domains", [])]
+        self._noise_strings_lower = [s.lower() for s in self._noise_filters.get("strings", [])]
+        self._noise_paths_lower = [p.lower() for p in self._noise_filters.get("paths", [])]
+    
     def _is_noise(self, match, category):
         """Check if match is noise."""
         match_lower = match.lower()
         
         # Check domain filters
-        for domain in self._noise_filters.get("domains", []):
-            if domain.lower() in match_lower:
+        for domain in self._noise_domains_lower:
+            if domain in match_lower:
                 return True
         
         # Check string filters
-        for string in self._noise_filters.get("strings", []):
-            if string.lower() in match_lower:
+        for string in self._noise_strings_lower:
+            if string in match_lower:
                 return True
         
         # Check path filters
-        for path in self._noise_filters.get("paths", []):
-            if path.lower() in match_lower:
+        for path in self._noise_paths_lower:
+            if path in match_lower:
                 return True
         
         return False
@@ -625,18 +634,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     def _add_result(self, category, match, url, messageInfo):
         """Add a result to the table."""
         with self._lock:
-            # Check for duplicates based on merge setting
+            # Check for duplicates based on merge setting using set-based O(1) lookup
             merge_mode = self._settings.get("merge_duplicates", "match_only")
+            cat_lower = category.lower()
             
-            if merge_mode != "none":
-                for result in self._results:
-                    if result['category'].lower() == category.lower() and result['match'] == match:
-                        if merge_mode == "match_only":
-                            # Duplicate by match only - skip
-                            return
-                        elif merge_mode == "match_and_url" and result['url'] == url:
-                            # Duplicate by match and URL - skip
-                            return
+            if merge_mode == "match_only":
+                dedup_key = (cat_lower, match)
+                if dedup_key in self._seen_match_only:
+                    return
+                self._seen_match_only.add(dedup_key)
+            elif merge_mode == "match_and_url":
+                dedup_key = (cat_lower, match, url)
+                if dedup_key in self._seen_match_and_url:
+                    return
+                self._seen_match_and_url.add(dedup_key)
             
             result = {
                 'category': category.capitalize(),
@@ -795,6 +806,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         """Clear all results."""
         with self._lock:
             self._results = []
+            self._seen_match_only.clear()
+            self._seen_match_and_url.clear()
         self._table_model.fireTableDataChanged()
         self._update_results_count()
         self._request_viewer.setMessage([], True)
@@ -1064,6 +1077,7 @@ class AddNoiseListener(ActionListener):
         if filter_val:
             filter_type = str(self._extender._noise_category.getSelectedItem())
             self._extender._noise_filters[filter_type].append(filter_val)
+            self._extender._compile_noise_filters()
             self._extender._update_noise_display()
             self._extender._save_custom_noise()
 
@@ -1097,6 +1111,7 @@ class ImportNoiseListener(ActionListener):
                         if line and not line.startswith('#'):
                             self._extender._noise_filters[filter_type].append(line)
                 
+                self._extender._compile_noise_filters()
                 self._extender._update_noise_display()
                 self._extender._save_custom_noise()
                 
@@ -1124,6 +1139,7 @@ class SaveNoiseListener(ActionListener):
         text = self._extender._noise_text.getText()
         filters = [f.strip() for f in text.split('\n') if f.strip()]
         self._extender._noise_filters[filter_type] = filters
+        self._extender._compile_noise_filters()
         self._extender._save_custom_noise()
         
         JOptionPane.showMessageDialog(
