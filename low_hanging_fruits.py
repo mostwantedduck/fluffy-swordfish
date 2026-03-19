@@ -7,19 +7,21 @@ Author: Daniel
 Version: 1.0.0
 """
 
-from burp import IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMessageEditorController
+from burp import IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMessageEditorController, IScanIssue
 from javax.swing import (
     JPanel, JTable, JScrollPane, JSplitPane, JLabel, JComboBox, JCheckBox,
     JButton, JTextField, JTextArea, JTabbedPane, JFileChooser, JOptionPane,
     SwingConstants, BorderFactory, BoxLayout, Box, ListSelectionModel,
-    JPopupMenu, JMenuItem
+    JPopupMenu, JMenuItem, DefaultCellEditor
 )
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from javax.swing.event import ListSelectionListener
 from javax.swing.filechooser import FileNameExtensionFilter
-from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, Font
+from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, Font, Desktop, Toolkit
 from java.awt.event import ActionListener, MouseAdapter
+from java.awt.datatransfer import StringSelection
 from java.io import File
+from java.net import URI
 from java.lang import Runnable
 import re
 import json
@@ -47,6 +49,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     # Content types to analyze
     ANALYZE_CONTENT_TYPES = ['javascript', 'json', 'ecmascript']
     
+    # Severity classification for findings
+    SEVERITY_RULES = {
+        'secrets': 'High',
+        'files': 'Medium',
+        'urls': 'Info',
+        'endpoints': 'Info',
+        'emails': 'Low'
+    }
+    HIGH_SECRET_PATTERNS = [
+        'AKIA', 'ASIA', 'sk_live_', 'pk_live_', 'rk_live_',
+        'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_',
+        'glpat-', 'xoxb-', 'xoxp-', 'xoxa-', 'xoxr-', 'xoxs-',
+        '-----BEGIN', 'eyJ'
+    ]
+    MEDIUM_URL_PATTERNS = [
+        'localhost', '127.0.0.1', '10.', '172.16.', '172.17.',
+        '172.18.', '172.19.', '172.2', '172.3', '192.168.',
+        'password=', 'token=', 'secret=', 'key=', 'auth=',
+        's3.amazonaws.com', '.blob.core.windows.net'
+    ]
+    
     def registerExtenderCallbacks(self, callbacks):
         """Initialize the extension."""
         self._callbacks = callbacks
@@ -63,9 +86,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._current_request = None
         self._current_response = None
         
+        # Initialize exclusions (false positives)
+        self._exclusions = {'matches': [], 'urls': []}
+        
         # Load patterns and settings
         self._load_patterns()
         self._load_settings()
+        self._load_exclusions()
         
         # Build UI
         self._build_ui()
@@ -211,6 +238,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         except Exception as e:
             print("[-] Error saving settings: {}".format(str(e)))
     
+    def _load_exclusions(self):
+        """Load false positive exclusions from Burp settings."""
+        try:
+            exclusions_json = self._callbacks.loadExtensionSetting("exclusions")
+            if exclusions_json:
+                self._exclusions = json.loads(exclusions_json)
+                print("[+] Loaded {} match exclusions, {} URL exclusions".format(
+                    len(self._exclusions.get('matches', [])),
+                    len(self._exclusions.get('urls', []))
+                ))
+        except Exception as e:
+            print("[-] Error loading exclusions: {}".format(str(e)))
+    
+    def _save_exclusions(self):
+        """Save false positive exclusions to Burp settings."""
+        try:
+            self._callbacks.saveExtensionSetting("exclusions", json.dumps(self._exclusions))
+            print("[+] Exclusions saved")
+        except Exception as e:
+            print("[-] Error saving exclusions: {}".format(str(e)))
+    
     def _save_custom_patterns(self):
         """Save custom patterns to Burp settings."""
         try:
@@ -302,6 +350,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         export_btn.addActionListener(ExportResultsListener(self))
         top_panel.add(export_btn)
         
+        # Search field
+        top_panel.add(Box.createHorizontalStrut(10))
+        top_panel.add(JLabel("Search:"))
+        self._search_field = JTextField(20)
+        self._search_field.addActionListener(SearchFilterListener(self))
+        top_panel.add(self._search_field)
+        
+        search_btn = JButton("Filter")
+        search_btn.addActionListener(SearchFilterListener(self))
+        top_panel.add(search_btn)
+        
         # Results count label
         self._results_count_label = JLabel("Results: 0")
         top_panel.add(Box.createHorizontalStrut(20))
@@ -319,9 +378,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._results_table.addMouseListener(ResultsTableMouseListener(self))
         
         # Set column widths
-        self._results_table.getColumnModel().getColumn(0).setPreferredWidth(100)
-        self._results_table.getColumnModel().getColumn(1).setPreferredWidth(400)
-        self._results_table.getColumnModel().getColumn(2).setPreferredWidth(300)
+        self._results_table.getColumnModel().getColumn(0).setPreferredWidth(80)
+        self._results_table.getColumnModel().getColumn(1).setPreferredWidth(70)
+        self._results_table.getColumnModel().getColumn(2).setPreferredWidth(380)
+        self._results_table.getColumnModel().getColumn(3).setPreferredWidth(270)
+        
+        # Color-code severity column with editable dropdown
+        self._results_table.getColumnModel().getColumn(1).setCellRenderer(SeverityCellRenderer())
+        severity_combo = JComboBox(["High", "Medium", "Low", "Info"])
+        self._results_table.getColumnModel().getColumn(1).setCellEditor(DefaultCellEditor(severity_combo))
         
         # Set row height
         self._results_table.setRowHeight(25)
@@ -468,10 +533,49 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         noise_panel.add(noise_buttons, BorderLayout.SOUTH)
         
         panel.add(noise_panel)
+        panel.add(Box.createVerticalStrut(10))
         
-        # Load initial pattern/noise values
+        # Exclusions (False Positives) section
+        excl_panel = JPanel()
+        excl_panel.setLayout(BoxLayout(excl_panel, BoxLayout.Y_AXIS))
+        excl_panel.setBorder(BorderFactory.createTitledBorder("Exclusions (False Positives)"))
+        excl_panel.setAlignmentX(0.0)
+        
+        # Excluded matches
+        excl_matches_label = JPanel(FlowLayout(FlowLayout.LEFT))
+        excl_matches_label.add(JLabel("Excluded Matches (one per line):"))
+        excl_panel.add(excl_matches_label)
+        
+        self._excl_matches_text = JTextArea(4, 50)
+        self._excl_matches_text.setFont(Font("Monospaced", Font.PLAIN, 12))
+        excl_panel.add(JScrollPane(self._excl_matches_text))
+        
+        # Excluded URLs
+        excl_urls_label = JPanel(FlowLayout(FlowLayout.LEFT))
+        excl_urls_label.add(JLabel("Excluded URLs (one per line):"))
+        excl_panel.add(excl_urls_label)
+        
+        self._excl_urls_text = JTextArea(4, 50)
+        self._excl_urls_text.setFont(Font("Monospaced", Font.PLAIN, 12))
+        excl_panel.add(JScrollPane(self._excl_urls_text))
+        
+        excl_buttons = JPanel(FlowLayout(FlowLayout.LEFT))
+        save_excl_btn = JButton("Save Exclusions")
+        save_excl_btn.addActionListener(SaveExclusionsListener(self))
+        excl_buttons.add(save_excl_btn)
+        
+        clear_excl_btn = JButton("Clear All Exclusions")
+        clear_excl_btn.addActionListener(ClearExclusionsListener(self))
+        excl_buttons.add(clear_excl_btn)
+        
+        excl_panel.add(excl_buttons)
+        
+        panel.add(excl_panel)
+        
+        # Load initial pattern/noise/exclusion values
         self._update_patterns_display()
         self._update_noise_display()
+        self._update_exclusions_display()
         
         return panel
     
@@ -631,6 +735,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         return False
     
+    def _get_severity(self, category, match):
+        """Classify finding severity based on category and match content."""
+        cat_lower = category.lower()
+        base_severity = self.SEVERITY_RULES.get(cat_lower, 'Info')
+        
+        # Promote secrets with known high-value patterns
+        if cat_lower == 'secrets':
+            for pattern in self.HIGH_SECRET_PATTERNS:
+                if pattern in match:
+                    return 'High'
+            return 'Medium'
+        
+        # Promote URLs with sensitive indicators
+        if cat_lower == 'urls':
+            match_lower = match.lower()
+            for pattern in self.MEDIUM_URL_PATTERNS:
+                if pattern in match_lower:
+                    return 'Medium'
+        
+        return base_severity
+    
     def _add_result(self, category, match, url, messageInfo):
         """Add a result to the table."""
         with self._lock:
@@ -653,13 +778,38 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                 'category': category.capitalize(),
                 'match': match[:200],  # Truncate long matches
                 'url': url,
+                'severity': self._get_severity(category, match),
                 'messageInfo': messageInfo
             }
             self._results.append(result)
             
+            # Report High/Medium findings as Burp Scanner issues
+            severity = result['severity']
+            if severity in ('High', 'Medium') and messageInfo:
+                self._report_issue(result, messageInfo)
+            
             # Update table on EDT
             from javax.swing import SwingUtilities
             SwingUtilities.invokeLater(UpdateTableRunnable(self))
+    
+    def _report_issue(self, result, messageInfo):
+        """Report a finding as a Burp Scanner issue."""
+        try:
+            http_service = messageInfo.getHttpService()
+            severity_map = {'High': 'High', 'Medium': 'Medium', 'Low': 'Low', 'Info': 'Information'}
+            issue = LHFScanIssue(
+                http_service,
+                self._helpers.analyzeRequest(messageInfo).getUrl(),
+                [messageInfo],
+                "LowHangingFruits: {} {}".format(result['category'], result.get('severity', 'Info')),
+                "The following {} was found in the response:<br><br><b>{}</b>".format(
+                    result['category'].lower(), result['match']),
+                severity_map.get(result.get('severity', 'Info'), 'Information'),
+                "Certain"
+            )
+            self._callbacks.addScanIssue(issue)
+        except Exception as e:
+            print("[-] Error reporting issue: {}".format(str(e)))
     
     def _update_table(self):
         """Update the results table."""
@@ -676,11 +826,32 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             self._results_count_label.setText("Results: {} / {} (filtered)".format(len(filtered), total))
     
     def _get_filtered_results(self):
-        """Get results filtered by category."""
+        """Get results filtered by category, search text, and exclusions."""
         filter_category = str(self._category_filter.getSelectedItem())
-        if filter_category == "All":
-            return self._results
-        return [r for r in self._results if r['category'] == filter_category]
+        search_text = str(self._search_field.getText()).strip().lower()
+        excluded_matches = set(self._exclusions.get('matches', []))
+        excluded_urls = set(self._exclusions.get('urls', []))
+        
+        results = self._results
+        
+        if filter_category != "All":
+            results = [r for r in results if r['category'] == filter_category]
+        
+        if search_text:
+            results = [r for r in results if search_text in r['match'].lower() or search_text in r['url'].lower()]
+        
+        if excluded_matches or excluded_urls:
+            results = [r for r in results if r['match'] not in excluded_matches and r['url'] not in excluded_urls]
+        
+        return results
+    
+    def _update_exclusions_display(self):
+        """Update the exclusions text areas in settings."""
+        try:
+            self._excl_matches_text.setText("\n".join(self._exclusions.get('matches', [])))
+            self._excl_urls_text.setText("\n".join(self._exclusions.get('urls', [])))
+        except Exception:
+            pass
     
     # ==================== IContextMenuFactory Implementation ====================
     
@@ -695,6 +866,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             send_to_repeater = JMenuItem("Send to Repeater")
             send_to_repeater.addActionListener(SendToRepeaterListener(self))
             menu_items.append(send_to_repeater)
+            
+            send_to_intruder = JMenuItem("Send to Intruder")
+            send_to_intruder.addActionListener(SendToIntruderListener(self))
+            menu_items.append(send_to_intruder)
+            
+            send_resp_comparer = JMenuItem("Send Response to Comparer")
+            send_resp_comparer.addActionListener(SendToComparerListener(self, False))
+            menu_items.append(send_resp_comparer)
+            
+            send_req_comparer = JMenuItem("Send Request to Comparer")
+            send_req_comparer.addActionListener(SendToComparerListener(self, True))
+            menu_items.append(send_req_comparer)
         
         return menu_items if menu_items else None
     
@@ -743,6 +926,51 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             )
             print("[+] Sent to Repeater: {}".format(result['url']))
     
+    def _send_to_intruder(self):
+        """Send selected item to Intruder."""
+        row = self._results_table.getSelectedRow()
+        if row < 0:
+            return
+        
+        filtered = self._get_filtered_results()
+        if row >= len(filtered):
+            return
+        
+        result = filtered[row]
+        messageInfo = result.get('messageInfo')
+        
+        if messageInfo:
+            http_service = messageInfo.getHttpService()
+            request = messageInfo.getRequest()
+            self._callbacks.sendToIntruder(
+                http_service.getHost(),
+                http_service.getPort(),
+                http_service.getProtocol() == "https",
+                request
+            )
+            print("[+] Sent to Intruder: {}".format(result['url']))
+    
+    def _send_to_comparer(self, is_request=False):
+        """Send selected item to Comparer."""
+        row = self._results_table.getSelectedRow()
+        if row < 0:
+            return
+        
+        filtered = self._get_filtered_results()
+        if row >= len(filtered):
+            return
+        
+        result = filtered[row]
+        messageInfo = result.get('messageInfo')
+        
+        if messageInfo:
+            if is_request:
+                self._callbacks.sendToComparer(messageInfo.getRequest())
+                print("[+] Sent request to Comparer: {}".format(result['url']))
+            else:
+                self._callbacks.sendToComparer(messageInfo.getResponse())
+                print("[+] Sent response to Comparer: {}".format(result['url']))
+    
     def _export_results(self):
         """Export results to file."""
         chooser = JFileChooser()
@@ -776,11 +1004,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                 )
     
     def _export_json(self, file_path):
-        """Export results to JSON file."""
+        """Export currently filtered results to JSON file."""
+        filtered = self._get_filtered_results()
         export_data = []
-        for result in self._results:
+        for result in filtered:
             export_data.append({
                 'category': result['category'],
+                'severity': result.get('severity', 'Info'),
                 'match': result['match'],
                 'url': result['url']
             })
@@ -789,15 +1019,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             json.dump(export_data, f, indent=2)
     
     def _export_csv(self, file_path):
-        """Export results to CSV file."""
+        """Export currently filtered results to CSV file."""
+        filtered = self._get_filtered_results()
         with open(file_path, 'w') as f:
-            f.write("Category,Match,URL\n")
-            for result in self._results:
+            f.write("Category,Severity,Match,URL\n")
+            for result in filtered:
                 # Escape CSV fields
                 match = result['match'].replace('"', '""')
                 url = result['url'].replace('"', '""')
-                f.write('"{}","{}","{}"\n'.format(
+                f.write('"{}","{}","{}","{}"\n'.format(
                     result['category'],
+                    result.get('severity', 'Info'),
                     match,
                     url
                 ))
@@ -820,7 +1052,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
 class ResultsTableModel(AbstractTableModel):
     """Table model for results."""
     
-    COLUMNS = ["Category", "Match", "URL"]
+    COLUMNS = ["Category", "Severity", "Match", "URL"]
     
     def __init__(self, extender):
         self._extender = extender
@@ -834,6 +1066,16 @@ class ResultsTableModel(AbstractTableModel):
     def getColumnName(self, column):
         return self.COLUMNS[column]
     
+    def isCellEditable(self, row, column):
+        return column == 1
+    
+    def setValueAt(self, value, row, column):
+        if column == 1:
+            filtered = self._extender._get_filtered_results()
+            if row < len(filtered):
+                filtered[row]['severity'] = str(value)
+                self.fireTableCellUpdated(row, column)
+    
     def getValueAt(self, row, column):
         filtered = self._extender._get_filtered_results()
         if row < len(filtered):
@@ -841,15 +1083,48 @@ class ResultsTableModel(AbstractTableModel):
             if column == 0:
                 return result['category']
             elif column == 1:
-                return result['match']
+                return result.get('severity', 'Info')
             elif column == 2:
+                return result['match']
+            elif column == 3:
                 return result['url']
         return ""
+
+
+class SeverityCellRenderer(DefaultTableCellRenderer):
+    """Color-coded cell renderer for the Severity column."""
+    
+    SEVERITY_COLORS = {
+        'High': Color(255, 70, 70),
+        'Medium': Color(255, 165, 0),
+        'Low': Color(100, 149, 237),
+        'Info': Color(144, 238, 144)
+    }
+    
+    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
+        component = DefaultTableCellRenderer.getTableCellRendererComponent(
+            self, table, value, isSelected, hasFocus, row, column
+        )
+        if not isSelected:
+            color = self.SEVERITY_COLORS.get(str(value), Color.WHITE)
+            component.setBackground(color)
+            component.setForeground(Color.BLACK)
+        component.setHorizontalAlignment(SwingConstants.CENTER)
+        return component
 
 
 # ==================== Event Listeners ====================
 
 class CategoryFilterListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        self._extender._table_model.fireTableDataChanged()
+        self._extender._update_results_count()
+
+
+class SearchFilterListener(ActionListener):
     def __init__(self, extender):
         self._extender = extender
     
@@ -898,7 +1173,21 @@ class ResultSelectionListener(ListSelectionListener):
             self._extender._request_viewer.setMessage(messageInfo.getRequest(), True)
             self._extender._response_viewer.setMessage(messageInfo.getResponse(), False)
             
-            # TODO: Highlight the match in response
+            # Try to highlight the match in response
+            try:
+                match_str = result.get('match', '')
+                response = messageInfo.getResponse()
+                if response and match_str:
+                    response_str = self._extender._helpers.bytesToString(response)
+                    resp_info = self._extender._helpers.analyzeResponse(response)
+                    body_offset = resp_info.getBodyOffset()
+                    match_start = response_str.find(match_str, body_offset)
+                    if match_start >= 0:
+                        markers = [[match_start, match_start + len(match_str)]]
+                        marked = self._extender._callbacks.applyMarkers(messageInfo, None, markers)
+                        self._extender._response_viewer.setMessage(marked.getResponse(), False)
+            except Exception:
+                pass
 
 
 class ResultsTableMouseListener(MouseAdapter):
@@ -921,6 +1210,39 @@ class ResultsTableMouseListener(MouseAdapter):
                 send_item = JMenuItem("Send to Repeater")
                 send_item.addActionListener(SendToRepeaterListener(self._extender))
                 popup.add(send_item)
+                
+                intruder_item = JMenuItem("Send to Intruder")
+                intruder_item.addActionListener(SendToIntruderListener(self._extender))
+                popup.add(intruder_item)
+                
+                comparer_resp_item = JMenuItem("Send Response to Comparer")
+                comparer_resp_item.addActionListener(SendToComparerListener(self._extender, False))
+                popup.add(comparer_resp_item)
+                
+                comparer_req_item = JMenuItem("Send Request to Comparer")
+                comparer_req_item.addActionListener(SendToComparerListener(self._extender, True))
+                popup.add(comparer_req_item)
+                
+                popup.addSeparator()
+                
+                copy_match_item = JMenuItem("Copy Match Value")
+                copy_match_item.addActionListener(CopyValueListener(self._extender, 'match'))
+                popup.add(copy_match_item)
+                
+                copy_url_item = JMenuItem("Copy URL")
+                copy_url_item.addActionListener(CopyValueListener(self._extender, 'url'))
+                popup.add(copy_url_item)
+                
+                open_url_item = JMenuItem("Open URL in Browser")
+                open_url_item.addActionListener(OpenUrlListener(self._extender))
+                popup.add(open_url_item)
+                
+                popup.addSeparator()
+                
+                fp_item = JMenuItem("Mark as False Positive...")
+                fp_item.addActionListener(MarkFalsePositiveListener(self._extender))
+                popup.add(fp_item)
+                
                 popup.show(event.getComponent(), event.getX(), event.getY())
 
 
@@ -930,6 +1252,101 @@ class SendToRepeaterListener(ActionListener):
     
     def actionPerformed(self, event):
         self._extender._send_to_repeater()
+
+
+class SendToIntruderListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        self._extender._send_to_intruder()
+
+
+class SendToComparerListener(ActionListener):
+    def __init__(self, extender, is_request):
+        self._extender = extender
+        self._is_request = is_request
+    
+    def actionPerformed(self, event):
+        self._extender._send_to_comparer(self._is_request)
+
+
+class CopyValueListener(ActionListener):
+    def __init__(self, extender, field):
+        self._extender = extender
+        self._field = field
+    
+    def actionPerformed(self, event):
+        row = self._extender._results_table.getSelectedRow()
+        if row < 0:
+            return
+        filtered = self._extender._get_filtered_results()
+        if row < len(filtered):
+            value = filtered[row].get(self._field, '')
+            clipboard = Toolkit.getDefaultToolkit().getSystemClipboard()
+            clipboard.setContents(StringSelection(value), None)
+            print("[+] Copied to clipboard: {}".format(value[:50]))
+
+
+class OpenUrlListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        row = self._extender._results_table.getSelectedRow()
+        if row < 0:
+            return
+        filtered = self._extender._get_filtered_results()
+        if row < len(filtered):
+            url = filtered[row].get('url', '')
+            if url:
+                try:
+                    Desktop.getDesktop().browse(URI(url))
+                    print("[+] Opened URL in browser: {}".format(url))
+                except Exception as e:
+                    print("[-] Error opening URL: {}".format(str(e)))
+
+
+class MarkFalsePositiveListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        row = self._extender._results_table.getSelectedRow()
+        if row < 0:
+            return
+        filtered = self._extender._get_filtered_results()
+        if row >= len(filtered):
+            return
+        result = filtered[row]
+        
+        options = ["Exclude by Match", "Exclude by URL", "Cancel"]
+        choice = JOptionPane.showOptionDialog(
+            self._extender._main_panel,
+            "Exclude future results matching:\n\nMatch: {}\nURL: {}".format(
+                result['match'][:80], result['url'][:80]),
+            "Mark as False Positive",
+            JOptionPane.DEFAULT_OPTION,
+            JOptionPane.QUESTION_MESSAGE,
+            None,
+            options,
+            options[0]
+        )
+        
+        if choice == 0:
+            self._extender._exclusions['matches'].append(result['match'])
+            self._extender._save_exclusions()
+            self._extender._table_model.fireTableDataChanged()
+            self._extender._update_results_count()
+            self._extender._update_exclusions_display()
+            print("[+] Excluded match: {}".format(result['match'][:50]))
+        elif choice == 1:
+            self._extender._exclusions['urls'].append(result['url'])
+            self._extender._save_exclusions()
+            self._extender._table_model.fireTableDataChanged()
+            self._extender._update_results_count()
+            self._extender._update_exclusions_display()
+            print("[+] Excluded URL: {}".format(result['url'][:50]))
 
 
 class SettingsChangeListener(ActionListener):
@@ -1150,9 +1567,100 @@ class SaveNoiseListener(ActionListener):
         )
 
 
+class SaveExclusionsListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        matches_text = self._extender._excl_matches_text.getText()
+        urls_text = self._extender._excl_urls_text.getText()
+        self._extender._exclusions['matches'] = [m.strip() for m in matches_text.split('\n') if m.strip()]
+        self._extender._exclusions['urls'] = [u.strip() for u in urls_text.split('\n') if u.strip()]
+        self._extender._save_exclusions()
+        self._extender._table_model.fireTableDataChanged()
+        self._extender._update_results_count()
+        
+        JOptionPane.showMessageDialog(
+            self._extender._main_panel,
+            "Exclusions saved ({} matches, {} URLs)".format(
+                len(self._extender._exclusions['matches']),
+                len(self._extender._exclusions['urls'])),
+            "Save Complete",
+            JOptionPane.INFORMATION_MESSAGE
+        )
+
+
+class ClearExclusionsListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        confirm = JOptionPane.showConfirmDialog(
+            self._extender._main_panel,
+            "Clear all exclusions? This will show previously excluded results.",
+            "Clear Exclusions",
+            JOptionPane.YES_NO_OPTION
+        )
+        if confirm == JOptionPane.YES_OPTION:
+            self._extender._exclusions = {'matches': [], 'urls': []}
+            self._extender._save_exclusions()
+            self._extender._update_exclusions_display()
+            self._extender._table_model.fireTableDataChanged()
+            self._extender._update_results_count()
+            print("[+] All exclusions cleared")
+
+
 class UpdateTableRunnable(Runnable):
     def __init__(self, extender):
         self._extender = extender
     
     def run(self):
         self._extender._update_table()
+
+
+# ==================== Scan Issue ====================
+
+class LHFScanIssue(IScanIssue):
+    """Custom scan issue for reporting findings to Burp Scanner."""
+    
+    def __init__(self, http_service, url, http_messages, name, detail, severity, confidence):
+        self._http_service = http_service
+        self._url = url
+        self._http_messages = http_messages
+        self._name = name
+        self._detail = detail
+        self._severity = severity
+        self._confidence = confidence
+    
+    def getUrl(self):
+        return self._url
+    
+    def getIssueName(self):
+        return self._name
+    
+    def getIssueType(self):
+        return 0
+    
+    def getSeverity(self):
+        return self._severity
+    
+    def getConfidence(self):
+        return self._confidence
+    
+    def getIssueBackground(self):
+        return "LowHangingFruits detected a potentially sensitive item in the HTTP response."
+    
+    def getRemediationBackground(self):
+        return None
+    
+    def getIssueDetail(self):
+        return self._detail
+    
+    def getRemediationDetail(self):
+        return "Review the finding and remove sensitive data from the response if it should not be exposed."
+    
+    def getHttpMessages(self):
+        return self._http_messages
+    
+    def getHttpService(self):
+        return self._http_service
