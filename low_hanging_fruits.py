@@ -28,6 +28,7 @@ import re
 import json
 import os
 import threading
+import math
 
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMessageEditorController):
@@ -54,6 +55,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     SEVERITY_RULES = {
         'secrets': 'High',
         'files': 'Medium',
+        'configurations': 'Medium',
         'urls': 'Info',
         'endpoints': 'Info',
         'emails': 'Low'
@@ -62,8 +64,23 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         'AKIA', 'ASIA', 'sk_live_', 'pk_live_', 'rk_live_',
         'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_',
         'glpat-', 'xoxb-', 'xoxp-', 'xoxa-', 'xoxr-', 'xoxs-',
-        '-----BEGIN', 'eyJ'
+        '-----BEGIN', 'eyJ',
+        'shpat_', 'shpss_', 'shpca_', 'shppa_',
+        'hvs.', 'hvb.', 'hvp.',
+        'sk-proj-', 'sk-ant-api03-',
+        'GOCSPX-', 'FwoGZX', 'PMAK-',
+        'dp.st.', 'dp.ct.',
+        'atlasv1-'
     ]
+    # Phase E: Patterns indicating test/dev/sandbox secrets (demote to Medium)
+    TEST_SECRET_INDICATORS = [
+        '_test_', '_dev_', '_staging_', '_sandbox_',
+        'test_', 'dev_', 'staging_', 'sandbox_',
+        'sk_test_', 'pk_test_', 'rk_test_',
+        'example', 'dummy', 'fake', 'sample'
+    ]
+    # Phase D: Minimum entropy threshold for generic secret patterns
+    ENTROPY_THRESHOLD = 3.0
     MEDIUM_URL_PATTERNS = [
         'localhost', '127.0.0.1', '10.', '172.16.', '172.17.',
         '172.18.', '172.19.', '172.2', '172.3', '192.168.',
@@ -140,7 +157,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             "urls": [],
             "secrets": [],
             "files": [],
-            "emails": []
+            "emails": [],
+            "configurations": []
         }
         
         # Default noise filters
@@ -344,7 +362,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         top_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         top_panel.add(JLabel("Filter by Category:"))
         
-        categories = ["All", "Endpoints", "URLs", "Secrets", "Files", "Emails"]
+        categories = ["All", "Endpoints", "URLs", "Secrets", "Files", "Emails", "Configurations"]
         self._category_filter = JComboBox(categories)
         self._category_filter.addActionListener(CategoryFilterListener(self))
         top_panel.add(self._category_filter)
@@ -446,7 +464,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         patterns_top = JPanel(FlowLayout(FlowLayout.LEFT))
         patterns_top.add(JLabel("Category:"))
-        self._pattern_category = JComboBox(["endpoints", "urls", "secrets", "files", "emails"])
+        self._pattern_category = JComboBox(["endpoints", "urls", "secrets", "files", "emails", "configurations"])
         self._pattern_category.addActionListener(PatternCategoryListener(self))
         patterns_top.add(self._pattern_category)
         patterns_panel.add(patterns_top, BorderLayout.NORTH)
@@ -761,6 +779,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                         if self._is_noise(match_str, category):
                             continue
                         
+                        # Phase D: Entropy filter for generic secret patterns
+                        if category == 'secrets' and self._is_low_entropy_generic(match_str):
+                            continue
+                        
                         # Add result
                         self._add_result(category, match_str, url, messageInfo)
                         
@@ -794,6 +816,33 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         return False
     
+    @staticmethod
+    def _calculate_entropy(value):
+        """Calculate Shannon entropy of a string (bits per character)."""
+        if not value:
+            return 0.0
+        freq = {}
+        for ch in value:
+            freq[ch] = freq.get(ch, 0) + 1
+        length = float(len(value))
+        return -sum((count / length) * math.log(count / length, 2) for count in freq.values())
+    
+    def _is_low_entropy_generic(self, match_str):
+        """Check if a secret match is a low-entropy generic pattern (likely FP).
+        Only applies to generic patterns (password=, token=, etc.), not prefixed tokens."""
+        # Skip entropy check for prefixed tokens — they are high confidence
+        for prefix in self.HIGH_SECRET_PATTERNS:
+            if prefix in match_str:
+                return False
+        # Extract the value portion after = or : delimiter
+        for delim in ['=', ':']:
+            if delim in match_str:
+                value = match_str.split(delim, 1)[1].strip().strip('"').strip("'")
+                if value and self._calculate_entropy(value) < self.ENTROPY_THRESHOLD:
+                    return True
+                return False
+        return False
+    
     def _get_severity(self, category, match):
         """Classify finding severity based on category and match content."""
         cat_lower = category.lower()
@@ -801,6 +850,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         # Promote secrets with known high-value patterns
         if cat_lower == 'secrets':
+            match_lower = match.lower()
+            # Phase E: Demote test/dev/sandbox secrets to Medium
+            for indicator in self.TEST_SECRET_INDICATORS:
+                if indicator in match_lower:
+                    return 'Medium'
+            # Demote DB connection strings to localhost
+            if ('://localhost' in match_lower or '://127.0.0.1' in match_lower) and '://' in match:
+                return 'Low'
             for pattern in self.HIGH_SECRET_PATTERNS:
                 if pattern in match:
                     return 'High'
@@ -812,6 +869,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             for pattern in self.MEDIUM_URL_PATTERNS:
                 if pattern in match_lower:
                     return 'Medium'
+        
+        # Configurations: promote cloud metadata to High
+        if cat_lower == 'configurations':
+            if '169.254.169.254' in match:
+                return 'High'
         
         return base_severity
     
