@@ -12,7 +12,7 @@ from javax.swing import (
     JPanel, JTable, JScrollPane, JSplitPane, JLabel, JComboBox, JCheckBox,
     JButton, JTextField, JTextArea, JTabbedPane, JFileChooser, JOptionPane,
     SwingConstants, BorderFactory, BoxLayout, Box, ListSelectionModel,
-    JPopupMenu, JMenuItem, DefaultCellEditor, SwingUtilities
+    JPopupMenu, JMenuItem, DefaultCellEditor, SwingUtilities, JDialog
 )
 from javax.swing.text import DefaultHighlighter, JTextComponent
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
@@ -21,9 +21,9 @@ from javax.swing.filechooser import FileNameExtensionFilter
 from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, Font, Desktop, Toolkit
 from java.awt.event import ActionListener, MouseAdapter
 from java.awt.datatransfer import StringSelection
-from java.io import File
-from java.net import URI
-from java.lang import Runnable
+from java.io import File, BufferedReader, InputStreamReader
+from java.net import URI, URL, HttpURLConnection
+from java.lang import Runnable, Thread as JThread
 import re
 import json
 import os
@@ -107,10 +107,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         # Initialize exclusions (false positives)
         self._exclusions = {'matches': [], 'urls': []}
         
+        # Initialize whiteboard
+        self._whiteboard = {
+            'Domains': [], 'Secrets': [], 'Files': [], 'Paths': [],
+            'Emails': [], 'URLs': [], 'Configurations': [], 'Other': []
+        }
+        
         # Load patterns and settings
         self._load_patterns()
         self._load_settings()
         self._load_exclusions()
+        self._load_whiteboard()
         
         # Build UI
         self._build_ui()
@@ -278,6 +285,291 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         except Exception as e:
             print("[-] Error saving exclusions: {}".format(str(e)))
     
+    def _load_whiteboard(self):
+        """Load whiteboard items from Burp settings."""
+        try:
+            wb_json = self._callbacks.loadExtensionSetting("whiteboard")
+            if wb_json:
+                saved = json.loads(wb_json)
+                for cat in self._whiteboard:
+                    if cat in saved:
+                        self._whiteboard[cat] = saved[cat]
+                total = sum(len(v) for v in self._whiteboard.values())
+                print("[+] Loaded {} whiteboard items".format(total))
+        except Exception as e:
+            print("[-] Error loading whiteboard: {}".format(str(e)))
+    
+    def _save_whiteboard(self):
+        """Save whiteboard items to Burp settings."""
+        try:
+            self._callbacks.saveExtensionSetting("whiteboard", json.dumps(self._whiteboard))
+        except Exception as e:
+            print("[-] Error saving whiteboard: {}".format(str(e)))
+    
+    def _classify_for_whiteboard(self, value, source_category):
+        """Auto-classify a value into a whiteboard category."""
+        val_lower = value.lower()
+        
+        if source_category.lower() == 'emails':
+            return 'Emails'
+        if source_category.lower() == 'configurations':
+            return 'Configurations'
+        
+        # Check for secrets (keys, tokens, passwords)
+        secret_indicators = ['key', 'token', 'secret', 'password', 'bearer', 'AKIA',
+                             'sk_live', 'sk_test', 'ghp_', 'glpat-', 'xox', '-----BEGIN',
+                             'eyJ', 'shpat_', 'hvs.']
+        for ind in secret_indicators:
+            if ind in value:
+                return 'Secrets'
+        
+        # Check for files
+        file_indicators = ['.sql', '.db', '.env', '.config', '.pem', '.key', '.crt',
+                           '.bak', '.log', '.yml', '.yaml', '.json', '.xml', '.csv',
+                           '.htaccess', '.htpasswd', '.ssh/', '.aws/', '.kube/']
+        for ind in file_indicators:
+            if ind in val_lower:
+                return 'Files'
+        
+        # Check for emails
+        if '@' in value and '.' in value.split('@')[-1]:
+            return 'Emails'
+        
+        # Check for URLs
+        if any(value.startswith(p) for p in ['http://', 'https://', 'ftp://', 'ws://', 'wss://']):
+            return 'URLs'
+        
+        # Check for domains (has dots, no spaces, no path separators at start)
+        if '.' in value and ' ' not in value and not value.startswith('/'):
+            parts = value.split('.')
+            if len(parts) >= 2 and all(p.replace('-', '').replace('_', '').isalnum() for p in parts if p):
+                return 'Domains'
+        
+        # Check for paths/endpoints
+        if value.startswith('/') or value.startswith('./') or value.startswith('../'):
+            return 'Paths'
+        
+        # Connection strings
+        if '://' in value:
+            return 'URLs'
+        
+        return 'Other'
+    
+    def _add_to_whiteboard(self, value, source_category=''):
+        """Add a value to the whiteboard with auto-classification."""
+        category = self._classify_for_whiteboard(value, source_category)
+        if value not in self._whiteboard[category]:
+            self._whiteboard[category].append(value)
+            self._save_whiteboard()
+            self._refresh_whiteboard_ui()
+            print("[+] Added to Whiteboard [{}]: {}".format(category, value[:60]))
+            return True
+        return False
+    
+    def _remove_from_whiteboard(self, category, value):
+        """Remove a value from the whiteboard."""
+        if category in self._whiteboard and value in self._whiteboard[category]:
+            self._whiteboard[category].remove(value)
+            self._save_whiteboard()
+            self._refresh_whiteboard_ui()
+    
+    # Known second-level TLDs that require 3 parts for root domain
+    SECOND_LEVEL_TLDS = [
+        'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'com.au', 'net.au', 'org.au',
+        'co.nz', 'co.za', 'co.in', 'co.jp', 'co.kr', 'com.br', 'com.mx',
+        'com.ar', 'com.co', 'com.es', 'com.tr', 'com.cn', 'com.tw', 'com.sg',
+        'com.hk', 'com.my', 'com.ph', 'com.pk', 'com.ng', 'com.eg', 'com.sa',
+        'org.es', 'gov.es', 'edu.es', 'gob.es'
+    ]
+    
+    @staticmethod
+    def _extract_domain(value):
+        """Extract the root domain from a URL or domain string.
+        e.g. https://www.sub.raiz.com/path -> raiz.com
+             api.test.openbank.es -> openbank.es
+             mail.example.co.uk -> example.co.uk"""
+        domain = value.strip()
+        # Strip protocol
+        for prefix in ['https://', 'http://', 'ftp://', 'wss://', 'ws://']:
+            if domain.lower().startswith(prefix):
+                domain = domain[len(prefix):]
+                break
+        # Strip path, port, auth
+        domain = domain.split('/')[0].split(':')[0].split('@')[-1].lower()
+        if not domain:
+            return None
+        
+        parts = domain.split('.')
+        if len(parts) <= 2:
+            return domain
+        
+        # Check for second-level TLDs (e.g. co.uk, com.es)
+        last_two = '.'.join(parts[-2:])
+        for sld in BurpExtender.SECOND_LEVEL_TLDS:
+            if last_two == sld:
+                return '.'.join(parts[-3:]) if len(parts) >= 3 else domain
+        
+        return '.'.join(parts[-2:])
+    
+    def _search_subdomains_async(self, domain):
+        """Launch subdomain search in a background thread with loading dialog."""
+        loading_dialog = JOptionPane(
+            "Searching subdomains for: {}\n\nQuerying crt.sh...".format(domain),
+            JOptionPane.INFORMATION_MESSAGE
+        )
+        dialog = loading_dialog.createDialog(self._main_panel, "Subdomain Search")
+        dialog.setModal(False)
+        dialog.setVisible(True)
+        
+        def _worker():
+            try:
+                subdomains = self._fetch_subdomains_crtsh(domain)
+                SwingUtilities.invokeLater(lambda: dialog.dispose())
+                if subdomains:
+                    SwingUtilities.invokeLater(lambda: self._show_subdomain_results(domain, subdomains))
+                else:
+                    SwingUtilities.invokeLater(lambda: JOptionPane.showMessageDialog(
+                        self._main_panel,
+                        "No subdomains found for: {}".format(domain),
+                        "Subdomain Search",
+                        JOptionPane.INFORMATION_MESSAGE
+                    ))
+            except Exception as e:
+                SwingUtilities.invokeLater(lambda: dialog.dispose())
+                SwingUtilities.invokeLater(lambda: JOptionPane.showMessageDialog(
+                    self._main_panel,
+                    "Error querying crt.sh: {}".format(str(e)),
+                    "Subdomain Search Error",
+                    JOptionPane.ERROR_MESSAGE
+                ))
+        
+        thread = threading.Thread(target=_worker)
+        thread.daemon = True
+        thread.start()
+    
+    def _fetch_subdomains_crtsh(self, domain):
+        """Query crt.sh for subdomains of the given domain."""
+        url_str = "https://crt.sh/?q=%25.{}&output=json".format(domain)
+        url = URL(url_str)
+        conn = url.openConnection()
+        conn.setRequestMethod("GET")
+        conn.setRequestProperty("User-Agent", "LowHangingFruits-BurpExtension/1.0")
+        conn.setConnectTimeout(15000)
+        conn.setReadTimeout(30000)
+        
+        response_code = conn.getResponseCode()
+        if response_code != 200:
+            raise Exception("HTTP {} from crt.sh".format(response_code))
+        
+        reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+        sb = []
+        line = reader.readLine()
+        while line is not None:
+            sb.append(line)
+            line = reader.readLine()
+        reader.close()
+        conn.disconnect()
+        
+        raw = "".join(sb)
+        entries = json.loads(raw)
+        
+        # Extract unique subdomains from name_value and common_name
+        subdomains = set()
+        for entry in entries:
+            for field in ['name_value', 'common_name']:
+                val = entry.get(field, '')
+                if val:
+                    for name in val.split('\n'):
+                        name = name.strip().lower()
+                        if name and '*' not in name and name.endswith(domain.lower()):
+                            subdomains.add(name)
+        
+        return sorted(subdomains)
+    
+    def _show_subdomain_results(self, domain, subdomains):
+        """Show a dialog with subdomain results for selective addition to whiteboard."""
+        frame = JOptionPane.getRootFrame()
+        result_dialog = JDialog(frame, "Subdomains for {}".format(domain), True)
+        result_dialog.setSize(500, 450)
+        result_dialog.setLocationRelativeTo(self._main_panel)
+        
+        panel = JPanel(BorderLayout())
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
+        
+        # Header
+        header = JLabel("{} subdomains found for {}".format(len(subdomains), domain))
+        header.setFont(Font("SansSerif", Font.BOLD, 13))
+        panel.add(header, BorderLayout.NORTH)
+        
+        # Checkboxes list
+        cb_panel = JPanel()
+        cb_panel.setLayout(BoxLayout(cb_panel, BoxLayout.Y_AXIS))
+        checkboxes = []
+        for sub in subdomains:
+            already = sub in self._whiteboard.get('Domains', [])
+            cb = JCheckBox(sub, not already)
+            if already:
+                cb.setForeground(Color.GRAY)
+                cb.setToolTipText("Already on Whiteboard")
+            cb.setFont(Font("Monospaced", Font.PLAIN, 12))
+            checkboxes.append(cb)
+            cb_panel.add(cb)
+        
+        scroll = JScrollPane(cb_panel)
+        panel.add(scroll, BorderLayout.CENTER)
+        
+        # Buttons
+        btn_panel = JPanel(FlowLayout(FlowLayout.RIGHT))
+        
+        select_all_btn = JButton("Select All")
+        deselect_all_btn = JButton("Deselect All")
+        add_btn = JButton("Add Selected to Whiteboard")
+        cancel_btn = JButton("Cancel")
+        
+        class SelectAllAction(ActionListener):
+            def actionPerformed(self_inner, event):
+                for cb in checkboxes:
+                    cb.setSelected(True)
+        
+        class DeselectAllAction(ActionListener):
+            def actionPerformed(self_inner, event):
+                for cb in checkboxes:
+                    cb.setSelected(False)
+        
+        extender_ref = self
+        class AddSelectedAction(ActionListener):
+            def actionPerformed(self_inner, event):
+                count = 0
+                for cb in checkboxes:
+                    if cb.isSelected():
+                        sub = cb.getText()
+                        if sub not in extender_ref._whiteboard.get('Domains', []):
+                            extender_ref._whiteboard['Domains'].append(sub)
+                            count += 1
+                if count > 0:
+                    extender_ref._save_whiteboard()
+                    extender_ref._refresh_whiteboard_ui()
+                    print("[+] Added {} subdomains to Whiteboard".format(count))
+                result_dialog.dispose()
+        
+        class CancelAction(ActionListener):
+            def actionPerformed(self_inner, event):
+                result_dialog.dispose()
+        
+        select_all_btn.addActionListener(SelectAllAction())
+        deselect_all_btn.addActionListener(DeselectAllAction())
+        add_btn.addActionListener(AddSelectedAction())
+        cancel_btn.addActionListener(CancelAction())
+        
+        btn_panel.add(select_all_btn)
+        btn_panel.add(deselect_all_btn)
+        btn_panel.add(add_btn)
+        btn_panel.add(cancel_btn)
+        panel.add(btn_panel, BorderLayout.SOUTH)
+        
+        result_dialog.setContentPane(panel)
+        result_dialog.setVisible(True)
+    
     def _save_custom_patterns(self):
         """Save custom patterns to Burp settings."""
         try:
@@ -345,6 +637,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         patterns_scroll = JScrollPane(patterns_panel)
         patterns_scroll.getVerticalScrollBar().setUnitIncrement(16)
         self._tabbed_pane.addTab("Patterns", patterns_scroll)
+        
+        # Build whiteboard panel
+        whiteboard_panel = self._build_whiteboard_panel()
+        self._tabbed_pane.addTab("Whiteboard", whiteboard_panel)
         
         # Build settings panel
         settings_panel = self._build_settings_panel()
@@ -536,6 +832,149 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._update_patterns_display()
         
         return panel
+    
+    def _build_whiteboard_panel(self):
+        """Build the Whiteboard panel with categorized investigation items."""
+        self._wb_main_panel = JPanel(BorderLayout())
+        
+        # Toolbar
+        toolbar = JPanel(FlowLayout(FlowLayout.LEFT))
+        toolbar.add(JLabel("Investigation Whiteboard"))
+        toolbar.add(Box.createHorizontalStrut(20))
+        
+        add_manual_btn = JButton("Add Item")
+        add_manual_btn.addActionListener(WhiteboardAddManualListener(self))
+        toolbar.add(add_manual_btn)
+        
+        export_wb_btn = JButton("Export Whiteboard")
+        export_wb_btn.addActionListener(WhiteboardExportListener(self))
+        toolbar.add(export_wb_btn)
+        
+        clear_wb_btn = JButton("Clear All")
+        clear_wb_btn.addActionListener(WhiteboardClearListener(self))
+        toolbar.add(clear_wb_btn)
+        
+        self._wb_count_label = JLabel("Items: 0")
+        toolbar.add(Box.createHorizontalStrut(20))
+        toolbar.add(self._wb_count_label)
+        
+        self._wb_main_panel.add(toolbar, BorderLayout.NORTH)
+        
+        # Scrollable content with category sections
+        self._wb_content = JPanel()
+        self._wb_content.setLayout(BoxLayout(self._wb_content, BoxLayout.Y_AXIS))
+        self._wb_content.setBorder(BorderFactory.createEmptyBorder(5, 10, 10, 10))
+        
+        # Category colors for visual distinction
+        self._wb_category_colors = {
+            'Domains': Color(52, 152, 219),
+            'Secrets': Color(231, 76, 60),
+            'Files': Color(230, 126, 34),
+            'Paths': Color(155, 89, 182),
+            'Emails': Color(26, 188, 156),
+            'URLs': Color(41, 128, 185),
+            'Configurations': Color(243, 156, 18),
+            'Other': Color(149, 165, 166)
+        }
+        
+        self._wb_text_areas = {}
+        for category in self._whiteboard:
+            cat_panel = JPanel(BorderLayout())
+            cat_panel.setAlignmentX(0.0)
+            
+            # Color-coded header
+            header = JPanel(FlowLayout(FlowLayout.LEFT))
+            color = self._wb_category_colors.get(category, Color.GRAY)
+            header.setBackground(color)
+            cat_label = JLabel("  {}  ".format(category))
+            cat_label.setForeground(Color.WHITE)
+            cat_label.setFont(Font("SansSerif", Font.BOLD, 13))
+            header.add(cat_label)
+            
+            count_label = JLabel("(0)")
+            count_label.setForeground(Color(255, 255, 255, 200))
+            count_label.setFont(Font("SansSerif", Font.PLAIN, 11))
+            header.add(count_label)
+            
+            cat_panel.add(header, BorderLayout.NORTH)
+            
+            # Text area for items
+            text_area = JTextArea(3, 50)
+            text_area.setFont(Font("Monospaced", Font.PLAIN, 12))
+            text_area.setEditable(False)
+            text_area.setLineWrap(True)
+            text_area.setWrapStyleWord(True)
+            
+            # Context menu for text area items
+            text_area.addMouseListener(WhiteboardItemMouseListener(self, category, text_area))
+            
+            cat_panel.add(JScrollPane(text_area), BorderLayout.CENTER)
+            
+            self._wb_text_areas[category] = (text_area, count_label)
+            self._wb_content.add(cat_panel)
+            self._wb_content.add(Box.createVerticalStrut(5))
+        
+        wb_scroll = JScrollPane(self._wb_content)
+        wb_scroll.getVerticalScrollBar().setUnitIncrement(16)
+        self._wb_main_panel.add(wb_scroll, BorderLayout.CENTER)
+        
+        # Populate initial data
+        self._refresh_whiteboard_ui()
+        
+        return self._wb_main_panel
+    
+    def _refresh_whiteboard_ui(self):
+        """Refresh all whiteboard text areas with current data."""
+        try:
+            total = 0
+            for category, (text_area, count_label) in self._wb_text_areas.items():
+                items = self._whiteboard.get(category, [])
+                text_area.setText("\n".join(items))
+                count_label.setText("({})".format(len(items)))
+                total += len(items)
+            self._wb_count_label.setText("Items: {}".format(total))
+        except Exception:
+            pass
+    
+    def _export_whiteboard(self):
+        """Export whiteboard to a file."""
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Export Whiteboard")
+        chooser.setFileFilter(FileNameExtensionFilter("Text Files", ["txt"]))
+        chooser.setFileFilter(FileNameExtensionFilter("JSON Files", ["json"]))
+        
+        if chooser.showSaveDialog(self._main_panel) == JFileChooser.APPROVE_OPTION:
+            file_path = str(chooser.getSelectedFile().getAbsolutePath())
+            try:
+                if file_path.endswith('.json'):
+                    with open(file_path, 'w') as f:
+                        json.dump(self._whiteboard, f, indent=2)
+                else:
+                    if not file_path.endswith('.txt'):
+                        file_path += '.txt'
+                    with open(file_path, 'w') as f:
+                        for category, items in self._whiteboard.items():
+                            if items:
+                                f.write("=" * 50 + "\n")
+                                f.write("  {}\n".format(category.upper()))
+                                f.write("=" * 50 + "\n")
+                                for item in items:
+                                    f.write("  {}\n".format(item))
+                                f.write("\n")
+                
+                JOptionPane.showMessageDialog(
+                    self._main_panel,
+                    "Whiteboard exported to: {}".format(file_path),
+                    "Export Complete",
+                    JOptionPane.INFORMATION_MESSAGE
+                )
+            except Exception as e:
+                JOptionPane.showMessageDialog(
+                    self._main_panel,
+                    "Error exporting: {}".format(str(e)),
+                    "Export Error",
+                    JOptionPane.ERROR_MESSAGE
+                )
     
     def _build_settings_panel(self):
         """Build the settings panel."""
@@ -1350,6 +1789,16 @@ class ResultsTableMouseListener(MouseAdapter):
                 
                 popup.addSeparator()
                 
+                wb_match_item = JMenuItem("Send Match to Whiteboard")
+                wb_match_item.addActionListener(SendToWhiteboardListener(self._extender, 'match'))
+                popup.add(wb_match_item)
+                
+                wb_url_item = JMenuItem("Send URL to Whiteboard")
+                wb_url_item.addActionListener(SendToWhiteboardListener(self._extender, 'url'))
+                popup.add(wb_url_item)
+                
+                popup.addSeparator()
+                
                 fp_item = JMenuItem("Mark as False Positive...")
                 fp_item.addActionListener(MarkFalsePositiveListener(self._extender))
                 popup.add(fp_item)
@@ -1756,6 +2205,168 @@ class ClearExclusionsListener(ActionListener):
             self._extender._table_model.fireTableDataChanged()
             self._extender._update_results_count()
             print("[+] All exclusions cleared")
+
+
+class SendToWhiteboardListener(ActionListener):
+    def __init__(self, extender, field):
+        self._extender = extender
+        self._field = field
+    
+    def actionPerformed(self, event):
+        row = self._extender._results_table.getSelectedRow()
+        if row < 0:
+            return
+        filtered = self._extender._get_filtered_results()
+        if row < len(filtered):
+            result = filtered[row]
+            value = result.get(self._field, '')
+            source_cat = result.get('category', '')
+            if value:
+                added = self._extender._add_to_whiteboard(value, source_cat)
+                if not added:
+                    print("[*] Already on Whiteboard: {}".format(value[:50]))
+
+
+class WhiteboardAddManualListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        value = JOptionPane.showInputDialog(
+            self._extender._main_panel,
+            "Enter value to add to Whiteboard:",
+            "Add to Whiteboard",
+            JOptionPane.PLAIN_MESSAGE
+        )
+        if value and value.strip():
+            self._extender._add_to_whiteboard(value.strip())
+
+
+class WhiteboardExportListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        self._extender._export_whiteboard()
+
+
+class WhiteboardClearListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        confirm = JOptionPane.showConfirmDialog(
+            self._extender._main_panel,
+            "Clear all Whiteboard items?",
+            "Confirm Clear",
+            JOptionPane.YES_NO_OPTION
+        )
+        if confirm == JOptionPane.YES_OPTION:
+            for cat in self._extender._whiteboard:
+                self._extender._whiteboard[cat] = []
+            self._extender._save_whiteboard()
+            self._extender._refresh_whiteboard_ui()
+            print("[+] Whiteboard cleared")
+
+
+class WhiteboardItemMouseListener(MouseAdapter):
+    def __init__(self, extender, category, text_area):
+        self._extender = extender
+        self._category = category
+        self._text_area = text_area
+    
+    def mousePressed(self, event):
+        self._show_popup(event)
+    
+    def mouseReleased(self, event):
+        self._show_popup(event)
+    
+    def _show_popup(self, event):
+        if not event.isPopupTrigger():
+            return
+        
+        # Get the line under the cursor
+        pos = self._text_area.viewToModel(event.getPoint())
+        text = self._text_area.getText()
+        if not text:
+            return
+        
+        lines = text.split('\n')
+        current = 0
+        selected_line = None
+        for line in lines:
+            if current <= pos <= current + len(line):
+                selected_line = line.strip()
+                break
+            current += len(line) + 1
+        
+        if not selected_line:
+            return
+        
+        popup = JPopupMenu()
+        
+        copy_item = JMenuItem("Copy: {}".format(selected_line[:50]))
+        copy_item.addActionListener(WhiteboardCopyListener(selected_line))
+        popup.add(copy_item)
+        
+        remove_item = JMenuItem("Remove from Whiteboard")
+        remove_item.addActionListener(WhiteboardRemoveListener(self._extender, self._category, selected_line))
+        popup.add(remove_item)
+        
+        if selected_line.startswith('http://') or selected_line.startswith('https://'):
+            open_item = JMenuItem("Open in Browser")
+            open_item.addActionListener(WhiteboardOpenUrlListener(selected_line))
+            popup.add(open_item)
+        
+        # Show subdomain search for Domains and URLs
+        if self._category in ('Domains', 'URLs'):
+            popup.addSeparator()
+            domain = BurpExtender._extract_domain(selected_line)
+            if domain:
+                subdomain_item = JMenuItem("Find Subdomains (crt.sh): {}".format(domain))
+                subdomain_item.addActionListener(WhiteboardSubdomainListener(self._extender, domain))
+                popup.add(subdomain_item)
+        
+        popup.show(event.getComponent(), event.getX(), event.getY())
+
+
+class WhiteboardCopyListener(ActionListener):
+    def __init__(self, value):
+        self._value = value
+    
+    def actionPerformed(self, event):
+        clipboard = Toolkit.getDefaultToolkit().getSystemClipboard()
+        clipboard.setContents(StringSelection(self._value), None)
+
+
+class WhiteboardRemoveListener(ActionListener):
+    def __init__(self, extender, category, value):
+        self._extender = extender
+        self._category = category
+        self._value = value
+    
+    def actionPerformed(self, event):
+        self._extender._remove_from_whiteboard(self._category, self._value)
+
+
+class WhiteboardOpenUrlListener(ActionListener):
+    def __init__(self, url):
+        self._url = url
+    
+    def actionPerformed(self, event):
+        try:
+            Desktop.getDesktop().browse(URI(self._url))
+        except Exception as e:
+            print("[-] Error opening URL: {}".format(str(e)))
+
+
+class WhiteboardSubdomainListener(ActionListener):
+    def __init__(self, extender, domain):
+        self._extender = extender
+        self._domain = domain
+    
+    def actionPerformed(self, event):
+        self._extender._search_subdomains_async(self._domain)
 
 
 class HighlightMatchRunnable(Runnable):
