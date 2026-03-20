@@ -315,16 +315,24 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         """Build the main UI panel."""
         self._main_panel = JPanel(BorderLayout())
         
-        # Create tabbed pane for Results and Settings
+        # Create tabbed pane for Results, Patterns, and Settings
         self._tabbed_pane = JTabbedPane()
         
         # Build results panel
         results_panel = self._build_results_panel()
         self._tabbed_pane.addTab("Results", results_panel)
         
+        # Build patterns panel
+        patterns_panel = self._build_patterns_panel()
+        patterns_scroll = JScrollPane(patterns_panel)
+        patterns_scroll.getVerticalScrollBar().setUnitIncrement(16)
+        self._tabbed_pane.addTab("Patterns", patterns_scroll)
+        
         # Build settings panel
         settings_panel = self._build_settings_panel()
-        self._tabbed_pane.addTab("Settings", settings_panel)
+        settings_scroll = JScrollPane(settings_panel)
+        settings_scroll.getVerticalScrollBar().setUnitIncrement(16)
+        self._tabbed_pane.addTab("Settings", settings_scroll)
         
         self._main_panel.add(self._tabbed_pane, BorderLayout.CENTER)
     
@@ -425,6 +433,92 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         return panel
     
+    def _build_patterns_panel(self):
+        """Build the patterns panel with custom patterns and pattern tester."""
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
+        
+        # Custom patterns section
+        patterns_panel = JPanel(BorderLayout())
+        patterns_panel.setBorder(BorderFactory.createTitledBorder("Custom Patterns"))
+        patterns_panel.setAlignmentX(0.0)
+        
+        patterns_top = JPanel(FlowLayout(FlowLayout.LEFT))
+        patterns_top.add(JLabel("Category:"))
+        self._pattern_category = JComboBox(["endpoints", "urls", "secrets", "files", "emails"])
+        self._pattern_category.addActionListener(PatternCategoryListener(self))
+        patterns_top.add(self._pattern_category)
+        patterns_panel.add(patterns_top, BorderLayout.NORTH)
+        
+        self._patterns_text = JTextArea(8, 50)
+        self._patterns_text.setFont(Font("Monospaced", Font.PLAIN, 12))
+        patterns_scroll = JScrollPane(self._patterns_text)
+        patterns_panel.add(patterns_scroll, BorderLayout.CENTER)
+        
+        patterns_buttons = JPanel(FlowLayout(FlowLayout.LEFT))
+        add_pattern_btn = JButton("Add Pattern")
+        add_pattern_btn.addActionListener(AddPatternListener(self))
+        patterns_buttons.add(add_pattern_btn)
+        
+        import_patterns_btn = JButton("Import from File")
+        import_patterns_btn.addActionListener(ImportPatternsListener(self))
+        patterns_buttons.add(import_patterns_btn)
+        
+        save_patterns_btn = JButton("Save Patterns")
+        save_patterns_btn.addActionListener(SavePatternsListener(self))
+        patterns_buttons.add(save_patterns_btn)
+        
+        patterns_panel.add(patterns_buttons, BorderLayout.SOUTH)
+        
+        panel.add(patterns_panel)
+        panel.add(Box.createVerticalStrut(10))
+        
+        # Pattern Tester section
+        tester_panel = JPanel(BorderLayout())
+        tester_panel.setBorder(BorderFactory.createTitledBorder("Pattern Tester"))
+        tester_panel.setAlignmentX(0.0)
+        
+        tester_top = JPanel(FlowLayout(FlowLayout.LEFT))
+        tester_top.add(JLabel("Regex:"))
+        self._tester_regex_field = JTextField(40)
+        self._tester_regex_field.setFont(Font("Monospaced", Font.PLAIN, 12))
+        tester_top.add(self._tester_regex_field)
+        test_btn = JButton("Test")
+        test_btn.addActionListener(PatternTesterListener(self))
+        tester_top.add(test_btn)
+        tester_panel.add(tester_top, BorderLayout.NORTH)
+        
+        tester_center = JPanel()
+        tester_center.setLayout(BoxLayout(tester_center, BoxLayout.Y_AXIS))
+        
+        sample_label = JPanel(FlowLayout(FlowLayout.LEFT))
+        sample_label.add(JLabel("Sample text (paste response body or any text to test against):"))
+        tester_center.add(sample_label)
+        
+        self._tester_sample_text = JTextArea(6, 50)
+        self._tester_sample_text.setFont(Font("Monospaced", Font.PLAIN, 12))
+        tester_center.add(JScrollPane(self._tester_sample_text))
+        
+        results_label = JPanel(FlowLayout(FlowLayout.LEFT))
+        results_label.add(JLabel("Matches found:"))
+        tester_center.add(results_label)
+        
+        self._tester_results_text = JTextArea(4, 50)
+        self._tester_results_text.setFont(Font("Monospaced", Font.PLAIN, 12))
+        self._tester_results_text.setEditable(False)
+        self._tester_results_text.setBackground(Color(245, 245, 245))
+        tester_center.add(JScrollPane(self._tester_results_text))
+        
+        tester_panel.add(tester_center, BorderLayout.CENTER)
+        
+        panel.add(tester_panel)
+        
+        # Load initial pattern values
+        self._update_patterns_display()
+        
+        return panel
+    
     def _build_settings_panel(self):
         """Build the settings panel."""
         panel = JPanel()
@@ -464,41 +558,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         general_panel.add(merge_panel)
         
         panel.add(general_panel)
-        panel.add(Box.createVerticalStrut(10))
-        
-        # Custom patterns section
-        patterns_panel = JPanel(BorderLayout())
-        patterns_panel.setBorder(BorderFactory.createTitledBorder("Custom Patterns"))
-        patterns_panel.setAlignmentX(0.0)
-        
-        patterns_top = JPanel(FlowLayout(FlowLayout.LEFT))
-        patterns_top.add(JLabel("Category:"))
-        self._pattern_category = JComboBox(["endpoints", "urls", "secrets", "files", "emails"])
-        self._pattern_category.addActionListener(PatternCategoryListener(self))
-        patterns_top.add(self._pattern_category)
-        patterns_panel.add(patterns_top, BorderLayout.NORTH)
-        
-        self._patterns_text = JTextArea(8, 50)
-        self._patterns_text.setFont(Font("Monospaced", Font.PLAIN, 12))
-        patterns_scroll = JScrollPane(self._patterns_text)
-        patterns_panel.add(patterns_scroll, BorderLayout.CENTER)
-        
-        patterns_buttons = JPanel(FlowLayout(FlowLayout.LEFT))
-        add_pattern_btn = JButton("Add Pattern")
-        add_pattern_btn.addActionListener(AddPatternListener(self))
-        patterns_buttons.add(add_pattern_btn)
-        
-        import_patterns_btn = JButton("Import from File")
-        import_patterns_btn.addActionListener(ImportPatternsListener(self))
-        patterns_buttons.add(import_patterns_btn)
-        
-        save_patterns_btn = JButton("Save Patterns")
-        save_patterns_btn.addActionListener(SavePatternsListener(self))
-        patterns_buttons.add(save_patterns_btn)
-        
-        patterns_panel.add(patterns_buttons, BorderLayout.SOUTH)
-        
-        panel.add(patterns_panel)
         panel.add(Box.createVerticalStrut(10))
         
         # Noise filters section
@@ -573,8 +632,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         panel.add(excl_panel)
         
-        # Load initial pattern/noise/exclusion values
-        self._update_patterns_display()
+        # Load initial noise/exclusion values
         self._update_noise_display()
         self._update_exclusions_display()
         
@@ -1469,6 +1527,43 @@ class SavePatternsListener(ActionListener):
             "Save Complete",
             JOptionPane.INFORMATION_MESSAGE
         )
+
+
+class PatternTesterListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        regex_str = self._extender._tester_regex_field.getText().strip()
+        sample = self._extender._tester_sample_text.getText()
+        
+        if not regex_str:
+            self._extender._tester_results_text.setText("[!] Enter a regex pattern to test.")
+            return
+        if not sample:
+            self._extender._tester_results_text.setText("[!] Enter sample text to test against.")
+            return
+        
+        try:
+            compiled = re.compile(regex_str)
+            matches = compiled.findall(sample)
+            
+            if not matches:
+                self._extender._tester_results_text.setText("No matches found.")
+                return
+            
+            # Format results
+            lines = ["[+] {} match(es) found:\n".format(len(matches))]
+            for i, match in enumerate(matches, 1):
+                if isinstance(match, tuple):
+                    match = match[0] if match[0] else ''.join(match)
+                lines.append("  {}. {}".format(i, str(match).strip()[:200]))
+            
+            self._extender._tester_results_text.setText("\n".join(lines))
+            self._extender._tester_results_text.setCaretPosition(0)
+            
+        except Exception as e:
+            self._extender._tester_results_text.setText("[ERROR] Invalid regex: {}".format(str(e)))
 
 
 class AddNoiseListener(ActionListener):
