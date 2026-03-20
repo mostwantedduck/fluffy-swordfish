@@ -12,7 +12,8 @@ from javax.swing import (
     JPanel, JTable, JScrollPane, JSplitPane, JLabel, JComboBox, JCheckBox,
     JButton, JTextField, JTextArea, JTabbedPane, JFileChooser, JOptionPane,
     SwingConstants, BorderFactory, BoxLayout, Box, ListSelectionModel,
-    JPopupMenu, JMenuItem, DefaultCellEditor, SwingUtilities, JDialog
+    JPopupMenu, JMenuItem, DefaultCellEditor, SwingUtilities, JDialog,
+    JList, DefaultListModel
 )
 from javax.swing.text import DefaultHighlighter, JTextComponent
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
@@ -115,6 +116,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._wb_status_cache = {}
         self._wb_status_lock = threading.Lock()
         self._wb_status_running = False
+        
+        # Initialize source maps collector
+        self._source_maps = []
+        self._source_maps_seen = set()
         
         # Load patterns and settings
         self._load_patterns()
@@ -649,6 +654,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         whiteboard_panel = self._build_whiteboard_panel()
         self._tabbed_pane.addTab("Whiteboard", whiteboard_panel)
         
+        # Build mappings panel
+        mappings_panel = self._build_mappings_panel()
+        self._tabbed_pane.addTab("Mappings", mappings_panel)
+        
         # Build settings panel
         settings_panel = self._build_settings_panel()
         settings_scroll = JScrollPane(settings_panel)
@@ -1131,6 +1140,376 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                     JOptionPane.ERROR_MESSAGE
                 )
     
+    # ==================== Source Maps / Mappings ====================
+    
+    def _collect_source_map(self, match, js_url):
+        """Collect a sourceMappingURL finding for the Mappings tab."""
+        # Extract the .map filename from the match (e.g., "//# sourceMappingURL=app.js.map")
+        import re as _re
+        m = _re.search(r'sourceMappingURL\s*=\s*(\S+)', match)
+        if not m:
+            return
+        map_ref = m.group(1).strip()
+        map_url = self._resolve_map_url(js_url, map_ref)
+        
+        if map_url in self._source_maps_seen:
+            return
+        self._source_maps_seen.add(map_url)
+        
+        entry = {
+            'js_url': js_url,
+            'map_url': map_url,
+            'status': 'Pending',
+            'sources': [],
+            'sourcesContent': [],
+            'names': []
+        }
+        self._source_maps.append(entry)
+        
+        try:
+            self._refresh_mappings_ui()
+        except Exception:
+            pass
+        print("[+] Source map discovered: {}".format(map_url[:80]))
+    
+    @staticmethod
+    def _resolve_map_url(js_url, map_ref):
+        """Resolve a .map reference relative to the JS file URL."""
+        if map_ref.startswith('http://') or map_ref.startswith('https://'):
+            return map_ref
+        if map_ref.startswith('//'):
+            protocol = 'https:' if js_url.startswith('https') else 'http:'
+            return protocol + map_ref
+        # Relative path — resolve against JS URL
+        base = js_url.rsplit('/', 1)[0] if '/' in js_url else js_url
+        return base + '/' + map_ref
+    
+    def _build_mappings_panel(self):
+        """Build the Mappings panel for source map extraction and analysis."""
+        self._map_panel = JPanel(BorderLayout())
+        self._map_findings = []
+        
+        # Toolbar
+        toolbar = JPanel(FlowLayout(FlowLayout.LEFT))
+        toolbar.add(JLabel("Source Map Extractor"))
+        toolbar.add(Box.createHorizontalStrut(20))
+        
+        fetch_all_btn = JButton("Fetch All")
+        fetch_all_btn.addActionListener(MappingsFetchAllListener(self))
+        toolbar.add(fetch_all_btn)
+        
+        scan_btn = JButton("Scan Sources for Secrets")
+        scan_btn.addActionListener(MappingsScanListener(self))
+        toolbar.add(scan_btn)
+        
+        export_btn = JButton("Export Sources")
+        export_btn.addActionListener(MappingsExportListener(self))
+        toolbar.add(export_btn)
+        
+        self._map_count_label = JLabel("Maps: 0")
+        toolbar.add(Box.createHorizontalStrut(20))
+        toolbar.add(self._map_count_label)
+        
+        self._map_panel.add(toolbar, BorderLayout.NORTH)
+        
+        # Main split: left (maps + files + findings) | right (source viewer)
+        main_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+        
+        # Left panel: 3 sections stacked
+        left_panel = JPanel()
+        left_panel.setLayout(BoxLayout(left_panel, BoxLayout.Y_AXIS))
+        
+        # Map list
+        map_list_panel = JPanel(BorderLayout())
+        map_list_panel.add(JLabel(" Discovered Source Maps"), BorderLayout.NORTH)
+        self._map_list_model = DefaultListModel()
+        self._map_list = JList(self._map_list_model)
+        self._map_list.setFont(Font("Monospaced", Font.PLAIN, 11))
+        self._map_list.addListSelectionListener(MappingsMapSelectionListener(self))
+        self._map_list.addMouseListener(MappingsMapMouseListener(self))
+        map_scroll = JScrollPane(self._map_list)
+        map_scroll.setPreferredSize(Dimension(400, 120))
+        map_list_panel.add(map_scroll, BorderLayout.CENTER)
+        left_panel.add(map_list_panel)
+        
+        # Source files list
+        files_panel = JPanel(BorderLayout())
+        files_panel.add(JLabel(" Source Files"), BorderLayout.NORTH)
+        self._map_files_model = DefaultListModel()
+        self._map_files_list = JList(self._map_files_model)
+        self._map_files_list.setFont(Font("Monospaced", Font.PLAIN, 11))
+        self._map_files_list.addListSelectionListener(MappingsFileSelectionListener(self))
+        files_scroll = JScrollPane(self._map_files_list)
+        files_scroll.setPreferredSize(Dimension(400, 150))
+        files_panel.add(files_scroll, BorderLayout.CENTER)
+        left_panel.add(files_panel)
+        
+        # Findings list
+        findings_panel = JPanel(BorderLayout())
+        self._map_findings_label = JLabel(" Findings (0)")
+        findings_panel.add(self._map_findings_label, BorderLayout.NORTH)
+        self._map_findings_model = DefaultListModel()
+        self._map_findings_list = JList(self._map_findings_model)
+        self._map_findings_list.setFont(Font("Monospaced", Font.PLAIN, 11))
+        self._map_findings_list.addListSelectionListener(MappingsFindingsSelectionListener(self))
+        findings_scroll = JScrollPane(self._map_findings_list)
+        findings_scroll.setPreferredSize(Dimension(400, 150))
+        findings_panel.add(findings_scroll, BorderLayout.CENTER)
+        left_panel.add(findings_panel)
+        
+        left_scroll = JScrollPane(left_panel)
+        main_split.setLeftComponent(left_scroll)
+        
+        # Right panel: search bar + source code viewer
+        viewer_panel = JPanel(BorderLayout())
+        
+        # Search bar
+        search_bar = JPanel(FlowLayout(FlowLayout.LEFT))
+        self._map_source_label = JLabel(" Source Code")
+        search_bar.add(self._map_source_label)
+        search_bar.add(Box.createHorizontalStrut(10))
+        search_bar.add(JLabel("Search:"))
+        self._map_search_field = JTextField(20)
+        self._map_search_field.addActionListener(MappingsSearchListener(self))
+        search_bar.add(self._map_search_field)
+        find_btn = JButton("Find")
+        find_btn.addActionListener(MappingsSearchListener(self))
+        search_bar.add(find_btn)
+        next_btn = JButton("Next")
+        next_btn.addActionListener(MappingsSearchNextListener(self))
+        search_bar.add(next_btn)
+        viewer_panel.add(search_bar, BorderLayout.NORTH)
+        
+        self._map_source_viewer = JTextArea()
+        self._map_source_viewer.setFont(Font("Monospaced", Font.PLAIN, 12))
+        self._map_source_viewer.setEditable(False)
+        self._map_source_viewer.setTabSize(4)
+        viewer_panel.add(JScrollPane(self._map_source_viewer), BorderLayout.CENTER)
+        
+        main_split.setRightComponent(viewer_panel)
+        main_split.setResizeWeight(0.3)
+        
+        self._map_panel.add(main_split, BorderLayout.CENTER)
+        
+        # Search state
+        self._map_search_pos = 0
+        
+        return self._map_panel
+    
+    def _refresh_mappings_ui(self):
+        """Refresh the mappings list UI."""
+        try:
+            self._map_list_model.clear()
+            for entry in self._source_maps:
+                self._map_list_model.addElement("[{}] {}".format(entry['status'], entry['map_url'][:100]))
+            self._map_count_label.setText("Maps: {}".format(len(self._source_maps)))
+        except Exception:
+            pass
+    
+    def _fetch_source_map(self, entry):
+        """Fetch and parse a single .map file."""
+        entry['status'] = 'Fetching...'
+        self._refresh_mappings_ui()
+        
+        conn = None
+        try:
+            url = URL(entry['map_url'])
+            conn = url.openConnection()
+            conn.setRequestMethod("GET")
+            conn.setConnectTimeout(10000)
+            conn.setReadTimeout(15000)
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (compatible)")
+            
+            code = conn.getResponseCode()
+            if code != 200:
+                entry['status'] = 'HTTP {}'.format(code)
+                return
+            
+            reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+            sb = []
+            line = reader.readLine()
+            while line is not None:
+                sb.append(line)
+                line = reader.readLine()
+            reader.close()
+            
+            raw = "".join(sb)
+            parsed = json.loads(raw)
+            
+            entry['sources'] = parsed.get('sources', [])
+            entry['sourcesContent'] = parsed.get('sourcesContent', [])
+            entry['names'] = parsed.get('names', [])
+            entry['status'] = 'Fetched ({} files)'.format(len(entry['sources']))
+            print("[+] Fetched source map: {} ({} sources)".format(
+                entry['map_url'][:60], len(entry['sources'])))
+            
+        except Exception as e:
+            entry['status'] = 'Error: {}'.format(str(e)[:50])
+            print("[-] Error fetching {}: {}".format(entry['map_url'][:60], str(e)))
+        finally:
+            if conn:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+    
+    def _fetch_all_maps_async(self):
+        """Fetch all pending source maps in background."""
+        pending = [e for e in self._source_maps if e['status'] == 'Pending']
+        if not pending:
+            JOptionPane.showMessageDialog(self._main_panel,
+                "No pending source maps to fetch.", "Mappings", JOptionPane.INFORMATION_MESSAGE)
+            return
+        
+        extender_ref = self
+        class FetchRunnable(Runnable):
+            def run(self_inner):
+                for entry in pending:
+                    extender_ref._fetch_source_map(entry)
+                    class Refresh(Runnable):
+                        def run(self_r):
+                            extender_ref._refresh_mappings_ui()
+                    SwingUtilities.invokeLater(Refresh())
+                    try:
+                        JThread.sleep(500)
+                    except Exception:
+                        pass
+                print("[+] All source maps fetched")
+        
+        t = JThread(FetchRunnable())
+        t.setDaemon(True)
+        t.start()
+    
+    def _scan_source_maps_async(self):
+        """Launch source map scan in background thread."""
+        self._map_findings = []
+        self._map_findings_model.clear()
+        self._map_findings_label.setText(" Findings (scanning...)")
+        
+        extender_ref = self
+        class ScanRunnable(Runnable):
+            def run(self_inner):
+                extender_ref._scan_source_maps_worker()
+        
+        t = JThread(ScanRunnable())
+        t.setDaemon(True)
+        t.start()
+    
+    def _scan_source_maps_worker(self):
+        """Background worker: scan source map contents for patterns."""
+        findings = []
+        seen = set()
+        
+        for map_idx, entry in enumerate(self._source_maps):
+            sources = entry.get('sources', [])
+            contents = entry.get('sourcesContent', [])
+            map_url = entry.get('map_url', '')
+            
+            if not contents:
+                continue
+            
+            for source_idx, content in enumerate(contents):
+                if not content:
+                    continue
+                source_name = sources[source_idx] if source_idx < len(sources) else 'unknown'
+                source_url = "[MAP] {} from {}".format(source_name, map_url.split('/')[-1])
+                
+                for category, compiled_patterns in self._compiled_patterns.items():
+                    for pattern in compiled_patterns:
+                        try:
+                            matches = pattern.findall(content)
+                            for match in matches:
+                                if isinstance(match, tuple):
+                                    match = match[0] if match[0] else ''.join(match)
+                                match_str = str(match).strip()
+                                if not match_str or len(match_str) < 3:
+                                    continue
+                                if self._is_noise(match_str, category):
+                                    continue
+                                if category == 'secrets' and self._is_low_entropy_generic(match_str):
+                                    continue
+                                dedup_key = (category, match_str)
+                                if dedup_key in seen:
+                                    continue
+                                seen.add(dedup_key)
+                                finding = {
+                                    'category': category.capitalize(),
+                                    'match': match_str[:200],
+                                    'source': source_name,
+                                    'map': map_url.split('/')[-1],
+                                    'map_idx': map_idx,
+                                    'source_idx': source_idx
+                                }
+                                findings.append(finding)
+                                self._add_result(category, match_str, source_url, None)
+                        except Exception:
+                            pass
+                
+                # Batch UI update every 50 findings
+                if len(findings) % 50 < 5 and findings:
+                    batch = findings[:]
+                    extender_ref = self
+                    class BatchUpdate(Runnable):
+                        def __init__(self_inner, b):
+                            self_inner._b = b
+                        def run(self_inner):
+                            extender_ref._map_findings_label.setText(
+                                " Findings ({}, scanning...)".format(len(self_inner._b)))
+                    SwingUtilities.invokeLater(BatchUpdate(batch))
+        
+        self._map_findings = findings
+        extender_ref = self
+        class FinalUpdate(Runnable):
+            def run(self_inner):
+                extender_ref._map_findings_model.clear()
+                for f in extender_ref._map_findings:
+                    extender_ref._map_findings_model.addElement("[{}] {} | {}".format(
+                        f['category'], f['match'][:80], f['source']))
+                extender_ref._map_findings_label.setText(
+                    " Findings ({})".format(len(extender_ref._map_findings)))
+        SwingUtilities.invokeLater(FinalUpdate())
+        print("[+] Source map scan: {} findings".format(len(findings)))
+    
+    def _export_sources(self):
+        """Export extracted source files to a directory."""
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Select Directory to Export Sources")
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY)
+        
+        if chooser.showSaveDialog(self._main_panel) != JFileChooser.APPROVE_OPTION:
+            return
+        
+        base_dir = str(chooser.getSelectedFile().getAbsolutePath())
+        count = 0
+        
+        for entry in self._source_maps:
+            sources = entry.get('sources', [])
+            contents = entry.get('sourcesContent', [])
+            map_name = entry['map_url'].split('/')[-1].replace('.map', '')
+            
+            for i, content in enumerate(contents):
+                if not content:
+                    continue
+                source_path = sources[i] if i < len(sources) else 'file_{}'.format(i)
+                # Clean path for filesystem
+                clean_path = source_path.replace('webpack://', '').replace('../', '').lstrip('/')
+                full_path = os.path.join(base_dir, map_name, clean_path)
+                
+                try:
+                    dir_path = os.path.dirname(full_path)
+                    if not os.path.exists(dir_path):
+                        os.makedirs(dir_path)
+                    with open(full_path, 'w') as f:
+                        f.write(content)
+                    count += 1
+                except Exception as e:
+                    print("[-] Error writing {}: {}".format(full_path, str(e)))
+        
+        JOptionPane.showMessageDialog(self._main_panel,
+            "Exported {} source files to:\n{}".format(count, base_dir),
+            "Export Complete", JOptionPane.INFORMATION_MESSAGE)
+        print("[+] Exported {} source files to {}".format(count, base_dir))
+    
     def _build_settings_panel(self):
         """Build the settings panel."""
         panel = JPanel()
@@ -1508,6 +1887,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             severity = result['severity']
             if severity in ('High', 'Medium') and messageInfo:
                 self._report_issue(result, messageInfo)
+            
+            # Auto-collect sourceMappingURL findings for Mappings tab
+            if cat_lower == 'configurations' and 'sourcemappingurl' in match.lower():
+                self._collect_source_map(match, url)
             
             # Update table on EDT
             from javax.swing import SwingUtilities
@@ -2543,6 +2926,244 @@ class WhiteboardOpenUrlListener(ActionListener):
             Desktop.getDesktop().browse(URI(self._url))
         except Exception as e:
             print("[-] Error opening URL: {}".format(str(e)))
+
+
+class MappingsSearchListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        query = self._extender._map_search_field.getText()
+        if not query:
+            return
+        text = self._extender._map_source_viewer.getText()
+        if not text:
+            return
+        self._extender._map_search_pos = 0
+        idx = text.find(query, 0)
+        if idx >= 0:
+            self._extender._map_source_viewer.setCaretPosition(idx)
+            self._extender._map_source_viewer.select(idx, idx + len(query))
+            self._extender._map_search_pos = idx + len(query)
+        else:
+            JOptionPane.showMessageDialog(self._extender._map_panel,
+                "Not found: {}".format(query), "Search", JOptionPane.INFORMATION_MESSAGE)
+
+
+class MappingsSearchNextListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        query = self._extender._map_search_field.getText()
+        if not query:
+            return
+        text = self._extender._map_source_viewer.getText()
+        if not text:
+            return
+        idx = text.find(query, self._extender._map_search_pos)
+        if idx >= 0:
+            self._extender._map_source_viewer.setCaretPosition(idx)
+            self._extender._map_source_viewer.select(idx, idx + len(query))
+            self._extender._map_search_pos = idx + len(query)
+        else:
+            # Wrap around
+            idx = text.find(query, 0)
+            if idx >= 0:
+                self._extender._map_source_viewer.setCaretPosition(idx)
+                self._extender._map_source_viewer.select(idx, idx + len(query))
+                self._extender._map_search_pos = idx + len(query)
+            else:
+                JOptionPane.showMessageDialog(self._extender._map_panel,
+                    "Not found: {}".format(query), "Search", JOptionPane.INFORMATION_MESSAGE)
+
+
+class MappingsFetchAllListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        self._extender._fetch_all_maps_async()
+
+
+class MappingsScanListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        self._extender._scan_source_maps_async()
+
+
+class MappingsExportListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        self._extender._export_sources()
+
+
+class MappingsMapSelectionListener(ListSelectionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def valueChanged(self, event):
+        if event.getValueIsAdjusting():
+            return
+        idx = self._extender._map_list.getSelectedIndex()
+        if idx < 0 or idx >= len(self._extender._source_maps):
+            return
+        entry = self._extender._source_maps[idx]
+        self._extender._map_files_model.clear()
+        for source in entry.get('sources', []):
+            self._extender._map_files_model.addElement(source)
+        self._extender._map_source_viewer.setText("")
+        self._extender._map_source_label.setText(" Source Code ({} files)".format(len(entry.get('sources', []))))
+
+
+class MappingsFileSelectionListener(ListSelectionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def valueChanged(self, event):
+        if event.getValueIsAdjusting():
+            return
+        map_idx = self._extender._map_list.getSelectedIndex()
+        file_idx = self._extender._map_files_list.getSelectedIndex()
+        if map_idx < 0 or file_idx < 0:
+            return
+        entry = self._extender._source_maps[map_idx]
+        contents = entry.get('sourcesContent', [])
+        sources = entry.get('sources', [])
+        if file_idx < len(contents) and contents[file_idx]:
+            self._extender._map_source_viewer.setText(contents[file_idx])
+            self._extender._map_source_viewer.setCaretPosition(0)
+            name = sources[file_idx] if file_idx < len(sources) else 'unknown'
+            self._extender._map_source_label.setText(" Source: {}".format(name))
+        else:
+            self._extender._map_source_viewer.setText("(no source content available)")
+
+
+class MappingsFindingsSelectionListener(ListSelectionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def valueChanged(self, event):
+        if event.getValueIsAdjusting():
+            return
+        idx = self._extender._map_findings_list.getSelectedIndex()
+        if idx < 0 or idx >= len(self._extender._map_findings):
+            return
+        finding = self._extender._map_findings[idx]
+        map_idx = finding.get('map_idx', -1)
+        source_idx = finding.get('source_idx', -1)
+        match_str = finding.get('match', '')
+        
+        if map_idx < 0 or source_idx < 0:
+            return
+        if map_idx >= len(self._extender._source_maps):
+            return
+        
+        entry = self._extender._source_maps[map_idx]
+        contents = entry.get('sourcesContent', [])
+        sources = entry.get('sources', [])
+        
+        if source_idx >= len(contents) or not contents[source_idx]:
+            return
+        
+        # Show source code
+        source_text = contents[source_idx]
+        source_name = sources[source_idx] if source_idx < len(sources) else 'unknown'
+        self._extender._map_source_viewer.setText(source_text)
+        self._extender._map_source_label.setText(" Source: {} | Match: {}".format(source_name, match_str[:40]))
+        
+        # Highlight all occurrences of the match and scroll to first
+        try:
+            viewer = self._extender._map_source_viewer
+            highlighter = viewer.getHighlighter()
+            highlighter.removeAllHighlights()
+            painter = DefaultHighlighter.DefaultHighlightPainter(Color(255, 165, 0, 120))
+            
+            first_pos = -1
+            start = 0
+            match_len = len(match_str)
+            while True:
+                pos = source_text.find(match_str, start)
+                if pos < 0:
+                    break
+                highlighter.addHighlight(pos, pos + match_len, painter)
+                if first_pos < 0:
+                    first_pos = pos
+                start = pos + match_len
+            
+            if first_pos >= 0:
+                viewer.setCaretPosition(first_pos)
+                try:
+                    rect = viewer.modelToView(first_pos)
+                    if rect:
+                        viewer.scrollRectToVisible(rect)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+class MappingsMapMouseListener(MouseAdapter):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def mousePressed(self, event):
+        self._show_popup(event)
+    
+    def mouseReleased(self, event):
+        self._show_popup(event)
+    
+    def _show_popup(self, event):
+        if not event.isPopupTrigger():
+            return
+        idx = self._extender._map_list.locationToIndex(event.getPoint())
+        if idx < 0 or idx >= len(self._extender._source_maps):
+            return
+        self._extender._map_list.setSelectedIndex(idx)
+        entry = self._extender._source_maps[idx]
+        
+        popup = JPopupMenu()
+        
+        if entry['status'] == 'Pending':
+            fetch_item = JMenuItem("Fetch this Source Map")
+            fetch_item.addActionListener(MappingsFetchSingleListener(self._extender, entry))
+            popup.add(fetch_item)
+        
+        copy_item = JMenuItem("Copy Map URL")
+        copy_item.addActionListener(WhiteboardCopyListener(entry['map_url']))
+        popup.add(copy_item)
+        
+        open_item = JMenuItem("Open Map URL in Browser")
+        open_item.addActionListener(WhiteboardOpenUrlListener(entry['map_url']))
+        popup.add(open_item)
+        
+        popup.show(event.getComponent(), event.getX(), event.getY())
+
+
+class MappingsFetchSingleListener(ActionListener):
+    def __init__(self, extender, entry):
+        self._extender = extender
+        self._entry = entry
+    
+    def actionPerformed(self, event):
+        extender_ref = self._extender
+        entry_ref = self._entry
+        
+        class FetchRunnable(Runnable):
+            def run(self_inner):
+                extender_ref._fetch_source_map(entry_ref)
+                class Refresh(Runnable):
+                    def run(self_r):
+                        extender_ref._refresh_mappings_ui()
+                SwingUtilities.invokeLater(Refresh())
+        
+        t = JThread(FetchRunnable())
+        t.setDaemon(True)
+        t.start()
 
 
 class WhiteboardSubdomainListener(ActionListener):
