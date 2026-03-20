@@ -112,6 +112,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             'Domains': [], 'Secrets': [], 'Files': [], 'Paths': [],
             'Emails': [], 'URLs': [], 'Configurations': [], 'Other': []
         }
+        self._wb_status_cache = {}
+        self._wb_status_lock = threading.Lock()
+        self._wb_status_running = False
         
         # Load patterns and settings
         self._load_patterns()
@@ -245,7 +248,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._settings = {
             "only_in_scope": False,
             "skip_media": True,
-            "merge_duplicates": "match_only"
+            "merge_duplicates": "match_only",
+            "status_checks_enabled": False
         }
         
         try:
@@ -362,6 +366,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             self._whiteboard[category].append(value)
             self._save_whiteboard()
             self._refresh_whiteboard_ui()
+            if category in ('Domains', 'URLs'):
+                self._trigger_status_checks()
             print("[+] Added to Whiteboard [{}]: {}".format(category, value[:60]))
             return True
         return False
@@ -549,6 +555,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                 if count > 0:
                     extender_ref._save_whiteboard()
                     extender_ref._refresh_whiteboard_ui()
+                    extender_ref._trigger_status_checks()
                     print("[+] Added {} subdomains to Whiteboard".format(count))
                 result_dialog.dispose()
         
@@ -927,14 +934,162 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         """Refresh all whiteboard text areas with current data."""
         try:
             total = 0
+            status_enabled = self._settings.get("status_checks_enabled", False)
             for category, (text_area, count_label) in self._wb_text_areas.items():
                 items = self._whiteboard.get(category, [])
-                text_area.setText("\n".join(items))
+                if category in ('Domains', 'URLs') and items:
+                    display_lines = []
+                    for item in items:
+                        if status_enabled:
+                            status = self._wb_status_cache.get(item, "checking...")
+                            display_lines.append("{}  [{}]".format(item, status))
+                        else:
+                            display_lines.append("{}  [status checks off]".format(item))
+                    text_area.setText("\n".join(display_lines))
+                else:
+                    text_area.setText("\n".join(items))
                 count_label.setText("({})".format(len(items)))
                 total += len(items)
             self._wb_count_label.setText("Items: {}".format(total))
         except Exception:
             pass
+    
+    def _trigger_status_checks(self):
+        """Start background HTTP status checks if enabled."""
+        if not self._settings.get("status_checks_enabled", False):
+            return
+        
+        # Increment generation to invalidate any stale threads
+        self._wb_check_generation = getattr(self, '_wb_check_generation', 0) + 1
+        gen = self._wb_check_generation
+        
+        print("[*] Starting status check thread (gen={})...".format(gen))
+        extender_ref = self
+        
+        class StatusCheckRunnable(Runnable):
+            def run(self_inner):
+                extender_ref._run_status_checks(gen)
+        
+        t = JThread(StatusCheckRunnable())
+        t.setDaemon(True)
+        t.start()
+    
+    def _run_status_checks(self, generation):
+        """Background worker: check HTTP status for all Domains and URLs items."""
+        print("[*] Status check thread started (gen={})".format(generation))
+        try:
+            items_to_check = []
+            for category in ('Domains', 'URLs'):
+                for item in self._whiteboard.get(category, []):
+                    if item not in self._wb_status_cache:
+                        items_to_check.append(item)
+            
+            print("[*] Status checks: {} items to check".format(len(items_to_check)))
+            
+            for item in items_to_check:
+                # Stop if disabled or a newer generation started
+                if not self._settings.get("status_checks_enabled", False):
+                    print("[*] Status checks disabled, stopping")
+                    break
+                if getattr(self, '_wb_check_generation', 0) != generation:
+                    print("[*] Newer check generation detected, stopping gen={}".format(generation))
+                    break
+                
+                print("[*] Checking: {}".format(item[:80]))
+                status = self._check_http_status_with_timeout(item)
+                print("[*] Result: {} -> {}".format(item[:60], status))
+                
+                self._wb_status_cache[item] = status
+                
+                extender_ref = self
+                class RefreshRunnable(Runnable):
+                    def run(self_inner):
+                        extender_ref._refresh_whiteboard_ui()
+                SwingUtilities.invokeLater(RefreshRunnable())
+                
+                # Throttle: 2 seconds between requests
+                try:
+                    JThread.sleep(2000)
+                except Exception:
+                    pass
+        except Exception as e:
+            print("[-] Status check error: {}".format(str(e)))
+        finally:
+            print("[*] Status checks finished (gen={})".format(generation))
+    
+    def _check_http_status_with_timeout(self, item, timeout_ms=6000):
+        """Check HTTP status with a hard timeout using a sub-thread."""
+        result_holder = [None]
+        
+        class CheckRunnable(Runnable):
+            def run(self_inner):
+                result_holder[0] = BurpExtender._check_http_status(item)
+        
+        checker = JThread(CheckRunnable())
+        checker.setDaemon(True)
+        checker.start()
+        
+        try:
+            checker.join(timeout_ms)
+        except Exception:
+            pass
+        
+        if result_holder[0] is not None:
+            return result_holder[0]
+        
+        # Thread didn't finish in time — it's stuck
+        print("[*] Timeout checking: {}".format(item[:60]))
+        try:
+            checker.interrupt()
+        except Exception:
+            pass
+        return "TIMEOUT"
+    
+    @staticmethod
+    def _check_http_status(item):
+        """Check HTTP status of a domain or URL via HEAD request."""
+        # Build target URL
+        if item.startswith('http://') or item.startswith('https://'):
+            target = item
+        else:
+            target = "https://{}".format(item)
+        
+        # Try HTTPS first
+        result = BurpExtender._do_head_request(target)
+        if result:
+            return result
+        
+        # Fallback to HTTP
+        plain = item.replace('https://', '').replace('http://', '')
+        result = BurpExtender._do_head_request("http://{}".format(plain))
+        if result:
+            return result
+        
+        return "NO RESPONSE"
+    
+    @staticmethod
+    def _do_head_request(target):
+        """Perform a single HEAD request. Returns status code string or None."""
+        conn = None
+        try:
+            url = URL(target)
+            conn = url.openConnection()
+            conn.setRequestMethod("HEAD")
+            conn.setConnectTimeout(3000)
+            conn.setReadTimeout(3000)
+            conn.setInstanceFollowRedirects(True)
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (compatible)")
+            conn.setUseCaches(False)
+            code = conn.getResponseCode()
+            return str(code)
+        except Exception:
+            return None
+        finally:
+            if conn:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
     
     def _export_whiteboard(self):
         """Export whiteboard to a file."""
@@ -997,6 +1152,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._skip_media_checkbox.setSelected(self._settings.get("skip_media", True))
         self._skip_media_checkbox.addActionListener(SettingsChangeListener(self))
         general_panel.add(self._skip_media_checkbox)
+        
+        # Whiteboard HTTP status checks
+        self._status_checks_checkbox = JCheckBox("Enable HTTP status checks on Whiteboard domains/URLs (background, non-aggressive)")
+        self._status_checks_checkbox.setSelected(self._settings.get("status_checks_enabled", False))
+        self._status_checks_checkbox.addActionListener(StatusChecksToggleListener(self))
+        general_panel.add(self._status_checks_checkbox)
         
         # Merge duplicates setting
         merge_panel = JPanel(FlowLayout(FlowLayout.LEFT))
@@ -1909,6 +2070,25 @@ class MarkFalsePositiveListener(ActionListener):
             print("[+] Excluded URL: {}".format(result['url'][:50]))
 
 
+class StatusChecksToggleListener(ActionListener):
+    def __init__(self, extender):
+        self._extender = extender
+    
+    def actionPerformed(self, event):
+        enabled = self._extender._status_checks_checkbox.isSelected()
+        self._extender._settings["status_checks_enabled"] = enabled
+        self._extender._save_settings()
+        # Reset state when toggling
+        self._extender._wb_status_running = False
+        if not enabled:
+            self._extender._wb_status_cache.clear()
+        self._extender._refresh_whiteboard_ui()
+        if enabled:
+            self._extender._wb_status_cache.clear()
+            self._extender._trigger_status_checks()
+        print("[+] HTTP status checks: {}".format("enabled" if enabled else "disabled"))
+
+
 class SettingsChangeListener(ActionListener):
     def __init__(self, extender):
         self._extender = extender
@@ -2303,25 +2483,30 @@ class WhiteboardItemMouseListener(MouseAdapter):
         if not selected_line:
             return
         
+        # Strip status suffix for Domains/URLs (e.g. "domain.com  [200]" -> "domain.com")
+        clean_value = selected_line
+        if self._category in ('Domains', 'URLs') and '  [' in selected_line:
+            clean_value = selected_line.rsplit('  [', 1)[0].strip()
+        
         popup = JPopupMenu()
         
-        copy_item = JMenuItem("Copy: {}".format(selected_line[:50]))
-        copy_item.addActionListener(WhiteboardCopyListener(selected_line))
+        copy_item = JMenuItem("Copy: {}".format(clean_value[:50]))
+        copy_item.addActionListener(WhiteboardCopyListener(clean_value))
         popup.add(copy_item)
         
         remove_item = JMenuItem("Remove from Whiteboard")
-        remove_item.addActionListener(WhiteboardRemoveListener(self._extender, self._category, selected_line))
+        remove_item.addActionListener(WhiteboardRemoveListener(self._extender, self._category, clean_value))
         popup.add(remove_item)
         
-        if selected_line.startswith('http://') or selected_line.startswith('https://'):
+        if clean_value.startswith('http://') or clean_value.startswith('https://'):
             open_item = JMenuItem("Open in Browser")
-            open_item.addActionListener(WhiteboardOpenUrlListener(selected_line))
+            open_item.addActionListener(WhiteboardOpenUrlListener(clean_value))
             popup.add(open_item)
         
         # Show subdomain search for Domains and URLs
         if self._category in ('Domains', 'URLs'):
             popup.addSeparator()
-            domain = BurpExtender._extract_domain(selected_line)
+            domain = BurpExtender._extract_domain(clean_value)
             if domain:
                 subdomain_item = JMenuItem("Find Subdomains (crt.sh): {}".format(domain))
                 subdomain_item.addActionListener(WhiteboardSubdomainListener(self._extender, domain))
