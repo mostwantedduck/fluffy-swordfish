@@ -105,6 +105,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         self._current_request = None
         self._current_response = None
         
+        # Performance: debounced table updates
+        self._table_dirty = False
+        self._table_update_pending = False
+        
+        # Performance: whiteboard dirty flag
+        self._wb_dirty = False
+        
         # Initialize exclusions (false positives)
         self._exclusions = {'matches': [], 'urls': []}
         
@@ -135,6 +142,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         callbacks.addSuiteTab(self)
         callbacks.registerContextMenuFactory(self)
         
+        # Start debounce timer thread
+        self._start_debounce_timer()
+        
         # Print banner
         self._print_banner()
     
@@ -149,6 +159,29 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
 ╚══════════════════════════════════════════════════════════════╝
         """.format(self.VERSION)
         print(banner)
+    
+    def _start_debounce_timer(self):
+        """Start a timer thread that batches table updates every 300ms."""
+        extender_ref = self
+        class TimerRunnable(Runnable):
+            def run(self_inner):
+                while True:
+                    try:
+                        JThread.sleep(300)
+                        if extender_ref._table_dirty:
+                            extender_ref._table_dirty = False
+                            class DoUpdate(Runnable):
+                                def run(self_r):
+                                    extender_ref._table_model.fireTableDataChanged()
+                                    extender_ref._update_results_count()
+                            SwingUtilities.invokeLater(DoUpdate())
+                    except Exception:
+                        pass
+        
+        t = JThread(TimerRunnable())
+        t.setDaemon(True)
+        t.setName("LHF-Debounce")
+        t.start()
     
     def _get_extension_dir(self):
         """Get the directory where the extension is located."""
@@ -188,8 +221,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         if os.path.exists(patterns_file):
             try:
                 with open(patterns_file, 'r') as f:
-                    self._patterns = json.load(f)
+                    loaded = json.load(f)
+                # Filter out comment keys (e.g. _comment_endpoints)
+                filtered = {k: v for k, v in loaded.items() if not k.startswith('_') and isinstance(v, list)}
+                for k in self._patterns:
+                    if k in filtered:
+                        self._patterns[k] = filtered[k]
+                    elif k not in filtered:
+                        print("[!] Category '{}' not found in patterns file, using defaults".format(k))
                 print("[+] Loaded default patterns from: {}".format(patterns_file))
+                for k, v in self._patterns.items():
+                    print("    [*] {}: {} patterns".format(k, len(v)))
             except Exception as e:
                 print("[-] Error loading patterns: {}".format(str(e)))
         
@@ -1380,8 +1422,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         t.setDaemon(True)
         t.start()
     
+    # Categories worth scanning in source maps (skip endpoints/urls/emails — too noisy in source code)
+    MAP_SCAN_CATEGORIES = ['secrets', 'configurations', 'files', 'urls']
+    MAP_SCAN_MAX_FILE_SIZE = 500000  # Skip files larger than 500KB
+    
     def _scan_source_maps_async(self):
         """Launch source map scan in background thread."""
+        self._map_scan_stop = False
         self._map_findings = []
         self._map_findings_model.clear()
         self._map_findings_label.setText(" Findings (scanning...)")
@@ -1393,28 +1440,46 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         
         t = JThread(ScanRunnable())
         t.setDaemon(True)
+        t.setName("LHF-MapScan")
         t.start()
     
     def _scan_source_maps_worker(self):
         """Background worker: scan source map contents for patterns."""
         findings = []
         seen = set()
+        total_files = sum(len(e.get('sourcesContent', [])) for e in self._source_maps)
+        files_scanned = 0
         
         for map_idx, entry in enumerate(self._source_maps):
+            if self._map_scan_stop:
+                break
+            
             sources = entry.get('sources', [])
             contents = entry.get('sourcesContent', [])
             map_url = entry.get('map_url', '')
+            map_name = map_url.split('/')[-1]
             
             if not contents:
                 continue
             
             for source_idx, content in enumerate(contents):
-                if not content:
-                    continue
-                source_name = sources[source_idx] if source_idx < len(sources) else 'unknown'
-                source_url = "[MAP] {} from {}".format(source_name, map_url.split('/')[-1])
+                if self._map_scan_stop:
+                    break
                 
-                for category, compiled_patterns in self._compiled_patterns.items():
+                files_scanned += 1
+                
+                if not content or len(content) > self.MAP_SCAN_MAX_FILE_SIZE:
+                    continue
+                
+                source_name = sources[source_idx] if source_idx < len(sources) else 'unknown'
+                # Safely encode source name for Jython ascii compatibility
+                try:
+                    source_name = source_name.encode('ascii', 'replace').decode('ascii')
+                except Exception:
+                    source_name = 'unknown'
+                
+                for category in self.MAP_SCAN_CATEGORIES:
+                    compiled_patterns = self._compiled_patterns.get(category, [])
                     for pattern in compiled_patterns:
                         try:
                             matches = pattern.findall(content)
@@ -1428,34 +1493,55 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                                     continue
                                 if category == 'secrets' and self._is_low_entropy_generic(match_str):
                                     continue
+                                # Skip sourceMappingURL findings (redundant)
+                                if 'sourcemappingurl' in match_str.lower():
+                                    continue
                                 dedup_key = (category, match_str)
                                 if dedup_key in seen:
                                     continue
                                 seen.add(dedup_key)
-                                finding = {
+                                findings.append({
                                     'category': category.capitalize(),
                                     'match': match_str[:200],
                                     'source': source_name,
-                                    'map': map_url.split('/')[-1],
+                                    'map': map_name,
                                     'map_idx': map_idx,
                                     'source_idx': source_idx
-                                }
-                                findings.append(finding)
-                                self._add_result(category, match_str, source_url, None)
+                                })
                         except Exception:
                             pass
                 
-                # Batch UI update every 50 findings
-                if len(findings) % 50 < 5 and findings:
-                    batch = findings[:]
+                # Progress update every 20 files
+                if files_scanned % 20 == 0:
+                    pct = int(100.0 * files_scanned / total_files) if total_files > 0 else 0
+                    count = len(findings)
                     extender_ref = self
-                    class BatchUpdate(Runnable):
-                        def __init__(self_inner, b):
-                            self_inner._b = b
+                    class ProgressUpdate(Runnable):
+                        def __init__(self_inner, p, c):
+                            self_inner._p = p
+                            self_inner._c = c
                         def run(self_inner):
                             extender_ref._map_findings_label.setText(
-                                " Findings ({}, scanning...)".format(len(self_inner._b)))
-                    SwingUtilities.invokeLater(BatchUpdate(batch))
+                                " Findings ({}, {}% scanned...)".format(self_inner._c, self_inner._p))
+                    SwingUtilities.invokeLater(ProgressUpdate(pct, count))
+                    # Yield CPU briefly
+                    try:
+                        JThread.sleep(5)
+                    except Exception:
+                        pass
+        
+        # Batch-add findings to main results
+        with self._lock:
+            for f in findings:
+                source_url = "[MAP] {} from {}".format(f['source'], f['map'])
+                self._results.append({
+                    'category': f['category'],
+                    'match': f['match'],
+                    'url': source_url,
+                    'severity': self._get_severity(f['category'].lower(), f['match']),
+                    'messageInfo': None
+                })
+            self._table_dirty = True
         
         self._map_findings = findings
         extender_ref = self
@@ -1468,7 +1554,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                 extender_ref._map_findings_label.setText(
                     " Findings ({})".format(len(extender_ref._map_findings)))
         SwingUtilities.invokeLater(FinalUpdate())
-        print("[+] Source map scan: {} findings".format(len(findings)))
+        print("[+] Source map scan complete: {} findings from {} files".format(len(findings), files_scanned))
     
     def _export_sources(self):
         """Export extracted source files to a directory."""
@@ -1660,39 +1746,36 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     # ==================== IHttpListener Implementation ====================
     
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        """Process HTTP messages."""
+        """Process HTTP messages — lightweight filtering on Burp's thread, heavy analysis offloaded."""
         if messageIsRequest:
             return
         
         try:
-            # Get request/response info
+            # Light filtering on Burp's HTTP thread
             request_info = self._helpers.analyzeRequest(messageInfo)
             response_info = self._helpers.analyzeResponse(messageInfo.getResponse())
             
             url = request_info.getUrl()
             url_str = str(url)
             
-            # Check if in scope
             if self._settings.get("only_in_scope", False):
                 if not self._callbacks.isInScope(url):
                     return
             
-            # Check content type for media
             if self._settings.get("skip_media", True):
                 content_type = self._get_content_type(response_info)
                 if self._is_media_type(content_type):
                     return
             
-            # Check if should analyze
             if not self._should_analyze(url_str, response_info, messageInfo):
                 return
             
-            # Get response body
+            # Extract body on Burp's thread (API access required here)
             response = messageInfo.getResponse()
             body_offset = response_info.getBodyOffset()
             body = self._helpers.bytesToString(response[body_offset:])
             
-            # Analyze content
+            # Analyze content (debounce timer handles batched UI updates)
             self._analyze_content(body, url_str, messageInfo)
             
         except Exception as e:
@@ -1748,7 +1831,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                         if isinstance(match, tuple):
                             match = match[0] if match[0] else ''.join(match)
                         
-                        match_str = str(match).strip()
+                        try:
+                            match_str = str(match).strip()
+                        except UnicodeEncodeError:
+                            match_str = match.encode('utf-8', 'replace').strip() if hasattr(match, 'encode') else str(match)
                         
                         # Skip empty matches
                         if not match_str or len(match_str) < 3:
@@ -1766,7 +1852,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
                         self._add_result(category, match_str, url, messageInfo)
                         
                 except Exception as e:
-                    print("[-] Error matching pattern: {}".format(str(e)))
+                    pass
     
     def _compile_noise_filters(self):
         """Pre-compute lowercased noise filter lists for fast matching."""
@@ -1858,6 +1944,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     
     def _add_result(self, category, match, url, messageInfo):
         """Add a result to the table."""
+        should_report = False
+        should_collect_map = False
+        result = None
+        
         with self._lock:
             # Check for duplicates based on merge setting using set-based O(1) lookup
             merge_mode = self._settings.get("merge_duplicates", "match_only")
@@ -1876,25 +1966,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             
             result = {
                 'category': category.capitalize(),
-                'match': match[:200],  # Truncate long matches
+                'match': match[:200],
                 'url': url,
                 'severity': self._get_severity(category, match),
                 'messageInfo': messageInfo
             }
             self._results.append(result)
+            self._table_dirty = True
             
-            # Report High/Medium findings as Burp Scanner issues
-            severity = result['severity']
-            if severity in ('High', 'Medium') and messageInfo:
-                self._report_issue(result, messageInfo)
-            
-            # Auto-collect sourceMappingURL findings for Mappings tab
-            if cat_lower == 'configurations' and 'sourcemappingurl' in match.lower():
-                self._collect_source_map(match, url)
-            
-            # Update table on EDT
-            from javax.swing import SwingUtilities
-            SwingUtilities.invokeLater(UpdateTableRunnable(self))
+            should_report = result['severity'] in ('High', 'Medium') and messageInfo is not None
+            should_collect_map = cat_lower == 'configurations' and 'sourcemappingurl' in match.lower()
+        
+        # Heavy operations outside the lock
+        if should_report:
+            self._report_issue(result, messageInfo)
+        if should_collect_map:
+            self._collect_source_map(match, url)
     
     def _report_issue(self, result, messageInfo):
         """Report a finding as a Burp Scanner issue."""
@@ -1923,7 +2010,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
     def _update_results_count(self):
         """Update the results count label."""
         filtered = self._get_filtered_results()
-        total = len(self._results)
+        with self._lock:
+            total = len(self._results)
         if len(filtered) == total:
             self._results_count_label.setText("Results: {}".format(total))
         else:
@@ -1936,7 +2024,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
         excluded_matches = set(self._exclusions.get('matches', []))
         excluded_urls = set(self._exclusions.get('urls', []))
         
-        results = self._results
+        # Thread-safe snapshot (Jython has no GIL)
+        with self._lock:
+            results = list(self._results)
         
         if filter_category != "All":
             results = [r for r in results if r['category'] == filter_category]
@@ -2144,6 +2234,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory, IMes
             self._results = []
             self._seen_match_only.clear()
             self._seen_match_and_url.clear()
+            self._table_dirty = False
         self._table_model.fireTableDataChanged()
         self._update_results_count()
         self._request_viewer.setMessage([], True)
